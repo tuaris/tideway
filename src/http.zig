@@ -20,32 +20,15 @@ pub fn serve(allocator: std.mem.Allocator, cfg: config.Config) !void {
         return error.InvalidListenAddress;
     };
 
-    // Create TCP listener
-    const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+    // Create TCP listener with direct IPv4 bind
+    const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(sockfd);
 
     // SO_REUSEADDR
     try posix.setsockopt(sockfd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
 
-    const listen_z = try allocator.dupeZ(u8, listen_hp.host);
-    defer allocator.free(listen_z);
-    var port_buf: [8]u8 = undefined;
-    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{listen_hp.port});
-    const port_z = try allocator.dupeZ(u8, port_str);
-    defer allocator.free(port_z);
-
-    var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
-    hints.family = posix.AF.INET;
-    hints.socktype = posix.SOCK.STREAM;
-    hints.flags = .{ .PASSIVE = true };
-
-    var ai_result: ?*std.c.addrinfo = null;
-    const gai_ret = std.c.getaddrinfo(listen_z, port_z, &hints, &ai_result);
-    if (@intFromEnum(gai_ret) != 0) return error.DnsResolutionFailed;
-    defer std.c.freeaddrinfo(ai_result.?);
-
-    const ai = ai_result.?;
-    try posix.bind(sockfd, ai.addr.?, ai.addrlen);
+    const addr = try std.net.Address.parseIp4(listen_hp.host, listen_hp.port);
+    try posix.bind(sockfd, &addr.any, addr.getOsSockLen());
     try posix.listen(sockfd, 128);
 
     log.info("HTTP JSON-RPC proxy listening on {s}:{d}", .{ listen_hp.host, listen_hp.port });
@@ -58,43 +41,20 @@ pub fn serve(allocator: std.mem.Allocator, cfg: config.Config) !void {
     var aux_state = auxpow.State.init(allocator, cfg.aux_chains);
     defer aux_state.deinit();
 
-    // Create kqueue
-    const kqfd = try posix.kqueue();
-    defer posix.close(kqfd);
+    log.info("accept loop started (aux_chains={d})", .{aux_state.chain_count()});
 
-    // Register listener + timer
-    var changelist: [2]posix.Kevent = undefined;
-    changelist[0] = makeEvent(sockfd, posix.system.EVFILT.READ, posix.system.EV.ADD, IDENT_LISTENER);
-
-    const timer_ms: isize = @intCast(cfg.parent.poll_interval_ms);
-    changelist[1] = .{
-        .ident = IDENT_AUX_TIMER,
-        .filter = posix.system.EVFILT.TIMER,
-        .flags = posix.system.EV.ADD,
-        .fflags = 0,
-        .data = timer_ms,
-        .udata = IDENT_AUX_TIMER,
-    };
-
-    _ = try posix.kevent(kqfd, &changelist, &[0]posix.Kevent{}, null);
-
-    log.info("kqueue event loop started (timer={d}ms, aux_chains={d})", .{
-        cfg.parent.poll_interval_ms,
-        aux_state.chain_count(),
-    });
-
-    // Main event loop
-    var events: [64]posix.Kevent = undefined;
+    // Simple blocking accept loop
+    // TODO: Replace with kqueue event loop for production (add timer-based aux refresh)
     while (true) {
-        const n = try posix.kevent(kqfd, &[0]posix.Kevent{}, &events, null);
+        const conn = posix.accept(sockfd, null, null, 0) catch |err| {
+            log.warn("accept failed: {}", .{err});
+            continue;
+        };
 
-        for (events[0..n]) |ev| {
-            if (ev.udata == IDENT_LISTENER) {
-                acceptAndHandle(allocator, sockfd, &parent_rpc, &aux_state);
-            } else if (ev.udata == IDENT_AUX_TIMER) {
-                refreshAuxTemplates(allocator, &aux_state);
-            }
-        }
+        handleHttpRequest(allocator, conn, &parent_rpc, &aux_state) catch |err| {
+            log.warn("HTTP handler error: {}", .{err});
+        };
+        posix.close(conn);
     }
 }
 
@@ -144,8 +104,9 @@ fn handleHttpRequest(
     parent_rpc: *rpc.Client,
     aux_state: *auxpow.State,
 ) !void {
-    // Read HTTP request
-    var buf: [4 * 1024 * 1024]u8 = undefined;
+    // Read HTTP request (heap-allocated — too large for stack)
+    const buf = try allocator.alloc(u8, 256 * 1024); // 256KB max request
+    defer allocator.free(buf);
     var total: usize = 0;
 
     while (total < buf.len) {
@@ -154,11 +115,12 @@ fn handleHttpRequest(
         total += n;
 
         // Check if we've received the full HTTP request (headers + body)
-        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |header_end| {
-            // Look for Content-Length to know when body is complete
-            const headers = buf[0..header_end];
+        // Support both \r\n\r\n (standard HTTP) and \n\n (ckpool uses plain \n)
+        const sep = findHeaderSeparator(buf[0..total]);
+        if (sep) |s| {
+            const headers = buf[0..s.pos];
             if (findContentLength(headers)) |content_len| {
-                const body_start = header_end + 4;
+                const body_start = s.pos + s.len;
                 const body_received = total - body_start;
                 if (body_received >= content_len) break;
             } else {
@@ -171,9 +133,9 @@ fn handleHttpRequest(
 
     const request = buf[0..total];
 
-    // Find the body (after \r\n\r\n)
-    const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
-    const body = request[header_end + 4 ..];
+    // Find the body (after header separator)
+    const sep = findHeaderSeparator(request) orelse return;
+    const body = request[sep.pos + sep.len ..];
 
     if (body.len == 0) {
         try sendHttpResponse(conn, 400, "{\"error\":\"empty body\"}");
@@ -222,22 +184,41 @@ fn sendHttpResponse(conn: posix.socket_t, status: u16, body: []const u8) !void {
     _ = try posix.write(conn, body);
 }
 
+const HeaderSep = struct { pos: usize, len: usize };
+
+/// Find the header/body separator — supports both \r\n\r\n (standard) and \n\n (ckpool)
+fn findHeaderSeparator(data: []const u8) ?HeaderSep {
+    // Check for standard \r\n\r\n first
+    if (std.mem.indexOf(u8, data, "\r\n\r\n")) |pos| {
+        return .{ .pos = pos, .len = 4 };
+    }
+    // Fallback: \n\n (ckpool sends plain \n line endings)
+    if (std.mem.indexOf(u8, data, "\n\n")) |pos| {
+        return .{ .pos = pos, .len = 2 };
+    }
+    return null;
+}
+
 fn findContentLength(headers: []const u8) ?usize {
     // Case-insensitive search for Content-Length header
+    // Supports both \r\n and \n line endings
     var i: usize = 0;
     while (i < headers.len) {
-        // Find next line
-        const line_end = std.mem.indexOf(u8, headers[i..], "\r\n") orelse headers.len - i;
-        const line = headers[i .. i + line_end];
+        // Find next line (handle both \r\n and \n)
+        const line_end = std.mem.indexOf(u8, headers[i..], "\n") orelse headers.len - i;
+        var line = headers[i .. i + line_end];
+        // Strip trailing \r if present
+        if (line.len > 0 and line[line.len - 1] == '\r') {
+            line = line[0 .. line.len - 1];
+        }
 
-        if (line.len > 16 and isContentLengthHeader(line)) {
-            // Extract value after ": "
-            if (std.mem.indexOf(u8, line, ": ")) |colon| {
-                const val_str = std.mem.trim(u8, line[colon + 2 ..], " ");
+        if (line.len > 14 and isContentLengthHeader(line)) {
+            if (std.mem.indexOf(u8, line, ":")) |colon| {
+                const val_str = std.mem.trim(u8, line[colon + 1 ..], " \t");
                 return std.fmt.parseInt(usize, val_str, 10) catch null;
             }
         }
-        i += line_end + 2;
+        i += line_end + 1;
     }
     return null;
 }
@@ -284,8 +265,11 @@ fn handleGetBlockTemplate(
     parent_rpc: *rpc.Client,
     aux_state: *auxpow.State,
 ) ![]const u8 {
+    log.info("getblocktemplate: forwarding {d} bytes to parent", .{request_body.len});
+
     // Forward to parent daemon
     var response = try parent_rpc.rawCall(allocator, request_body);
+    log.info("getblocktemplate: got {d} bytes from parent", .{response.len});
 
     // If aux chains configured, enrich the coinbaseaux.flags with AuxPoW commitment
     if (aux_state.chain_count() > 0) {
