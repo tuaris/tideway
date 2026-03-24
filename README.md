@@ -103,24 +103,13 @@ In the pool config, set the `btcd` URL to Tideway's listen address. The pool's g
 
 ### SeaTidePool
 
-SeaTidePool requires a small patch (~113 lines) to parse aux fields from the enriched `getblocktemplate` response, insert the AuxPoW commitment into the coinbase, and check aux chain targets at share time. No changes to the pool's core architecture — the generator runs normally, connecting to Tideway via its standard `btcd` URL.
-
-See [doc/CKPOOL_PATCHES.md](doc/CKPOOL_PATCHES.md) for a detailed walkthrough.
-
-**Summary of changes:**
-
-| File | Lines | Purpose |
-|------|-------|---------|
-| `src/auxpow.c` | +100 | New file: parse aux fields, insert coinbase commitment, check aux targets, submit aux solves |
-| `src/auxpow.h` | +53 | New file: `auxpow_t` struct, `aux_chain_t`, function prototypes |
-| `src/stratifier.c` | +5 | Three one-line calls to auxpow functions + buffer resize |
-| `src/stratifier.h` | +2 | Include `auxpow.h`, add `auxpow_t` field to workbase |
-| `src/generator.c` | +3 | `submitauxblock` handler in generator loop |
-| `Makefile` | +1 | Add `auxpow.o` to build |
+[SeaTidePool](https://git.morante.net/TidePool/SeaTidePool) has **native AuxPoW support** — no patches required. Point the `btcd` URL at Tideway and it works out of the box.
 
 ### ckpool
 
-The same patch applies to upstream ckpool. No changes to `ckpool.c` or `ckpool.h` are required — the proxy approach means the generator runs unmodified.
+Upstream ckpool requires a small patch (~113 lines) to parse aux fields from the enriched `getblocktemplate` response, insert the AuxPoW commitment into the coinbase, and check aux chain targets at share time. No changes to `ckpool.c` or `ckpool.h` — the proxy approach means the generator runs unmodified.
+
+See [doc/CKPOOL_PATCHES.md](doc/CKPOOL_PATCHES.md) for a detailed walkthrough.
 
 ## Documentation
 
