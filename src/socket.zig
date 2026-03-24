@@ -6,8 +6,12 @@ const auxpow = @import("auxpow.zig");
 
 const log = std.log.scoped(.socket);
 
+const IDENT_LISTENER: usize = 0;
+const IDENT_AUX_TIMER: usize = 1;
+const IDENT_CLIENT_BASE: usize = 1000;
+
 /// Serve the ckpool generator Unix socket protocol.
-/// This is the main event loop — blocks until shutdown.
+/// Uses kqueue for event-driven I/O (FreeBSD native).
 pub fn serve(allocator: std.mem.Allocator, cfg: config.Config) !void {
     // Remove stale socket file if it exists
     std.fs.cwd().deleteFile(cfg.socket_path) catch |err| switch (err) {
@@ -17,11 +21,11 @@ pub fn serve(allocator: std.mem.Allocator, cfg: config.Config) !void {
 
     // Create and bind Unix domain socket
     const addr = try std.net.Address.initUnix(cfg.socket_path);
-    const sockfd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+    const sockfd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
     defer posix.close(sockfd);
 
     try posix.bind(sockfd, &addr.any, addr.getOsSockLen());
-    try posix.listen(sockfd, 5);
+    try posix.listen(sockfd, 128);
 
     log.info("listening on {s}", .{cfg.socket_path});
 
@@ -33,18 +37,88 @@ pub fn serve(allocator: std.mem.Allocator, cfg: config.Config) !void {
     var aux_state = auxpow.State.init(allocator, cfg.aux_chains);
     defer aux_state.deinit();
 
-    // Accept loop
+    // Create kqueue
+    const kqfd = try posix.kqueue();
+    defer posix.close(kqfd);
+
+    // Register listening socket for read events (new connections)
+    var changelist: [2]posix.Kevent = undefined;
+    changelist[0] = makeEvent(sockfd, posix.system.EVFILT.READ, posix.system.EV.ADD, IDENT_LISTENER);
+
+    // Register aux template refresh timer (fires every poll_interval_ms)
+    const timer_ms: isize = @intCast(cfg.parent.poll_interval_ms);
+    changelist[1] = .{
+        .ident = IDENT_AUX_TIMER,
+        .filter = posix.system.EVFILT.TIMER,
+        .flags = posix.system.EV.ADD,
+        .fflags = 0,
+        .data = timer_ms,
+        .udata = IDENT_AUX_TIMER,
+    };
+
+    // Apply initial registrations
+    _ = try posix.kevent(kqfd, &changelist, &[0]posix.Kevent{}, null);
+
+    log.info("kqueue event loop started (timer={d}ms, aux_chains={d})", .{
+        cfg.parent.poll_interval_ms,
+        aux_state.chain_count(),
+    });
+
+    // Main event loop
+    var events: [64]posix.Kevent = undefined;
+    while (true) {
+        const n = try posix.kevent(kqfd, &[0]posix.Kevent{}, &events, null);
+
+        for (events[0..n]) |ev| {
+            if (ev.udata == IDENT_LISTENER) {
+                // New connection on listening socket
+                acceptAndHandle(allocator, sockfd, &parent_rpc, &aux_state);
+            } else if (ev.udata == IDENT_AUX_TIMER) {
+                // Timer fired — refresh aux chain templates
+                refreshAuxTemplates(allocator, &aux_state);
+            }
+            // Future: ZMQ PULL fd events (IDENT_ZMQ_PULL)
+        }
+    }
+}
+
+fn makeEvent(fd: posix.fd_t, filter: i16, flags: u16, udata: usize) posix.Kevent {
+    return .{
+        .ident = @intCast(fd),
+        .filter = filter,
+        .flags = flags,
+        .fflags = 0,
+        .data = 0,
+        .udata = udata,
+    };
+}
+
+fn acceptAndHandle(
+    allocator: std.mem.Allocator,
+    sockfd: posix.fd_t,
+    parent_rpc: *rpc.Client,
+    aux_state: *auxpow.State,
+) void {
+    // Accept all pending connections (non-blocking socket)
     while (true) {
         const conn = posix.accept(sockfd, null, null) catch |err| {
+            if (err == error.WouldBlock) break;
             log.warn("accept failed: {}", .{err});
-            continue;
+            break;
         };
-        defer posix.close(conn);
 
-        handleConnection(allocator, conn, &parent_rpc, &aux_state) catch |err| {
+        handleConnection(allocator, conn, parent_rpc, aux_state) catch |err| {
             log.warn("connection handler error: {}", .{err});
         };
+        posix.close(conn);
     }
+}
+
+fn refreshAuxTemplates(allocator: std.mem.Allocator, aux_state: *auxpow.State) void {
+    if (aux_state.chain_count() == 0) return;
+    aux_state.refreshTemplates(allocator) catch |err| {
+        log.warn("aux template refresh failed: {}", .{err});
+    };
 }
 
 fn handleConnection(
