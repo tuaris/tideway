@@ -6,8 +6,12 @@ const auxpow = @import("auxpow.zig");
 
 const log = std.log.scoped(.http);
 
-const IDENT_LISTENER: usize = 0;
-const IDENT_AUX_TIMER: usize = 1;
+/// Shared proxy state protected by a mutex for thread-safe access.
+const SharedState = struct {
+    parent_rpc: rpc.Client,
+    aux_state: auxpow.State,
+    mutex: std.Thread.Mutex = .{},
+};
 
 /// HTTP JSON-RPC proxy server.
 /// Sits between SeaTidePool's generator and the parent chain daemon.
@@ -33,77 +37,48 @@ pub fn serve(allocator: std.mem.Allocator, cfg: config.Config) !void {
 
     log.info("HTTP JSON-RPC proxy listening on {s}:{d}", .{ listen_hp.host, listen_hp.port });
 
-    // Initialize RPC client to parent daemon
-    var parent_rpc = rpc.Client.init(allocator, cfg.parent.host, cfg.parent.port, cfg.parent.user, cfg.parent.pass);
-    defer parent_rpc.deinit();
+    // Initialize shared state (parent RPC client + aux chain state)
+    var shared = SharedState{
+        .parent_rpc = rpc.Client.init(allocator, cfg.parent.host, cfg.parent.port, cfg.parent.user, cfg.parent.pass),
+        .aux_state = auxpow.State.init(allocator, cfg.aux_chains),
+    };
+    defer shared.parent_rpc.deinit();
+    defer shared.aux_state.deinit();
 
-    // Initialize aux chain state
-    var aux_state = auxpow.State.init(allocator, cfg.aux_chains);
-    defer aux_state.deinit();
+    log.info("threaded accept loop started (aux_chains={d})", .{shared.aux_state.chain_count()});
 
-    log.info("accept loop started (aux_chains={d})", .{aux_state.chain_count()});
-
-    // Simple blocking accept loop
-    // TODO: Replace with kqueue event loop for production (add timer-based aux refresh)
+    // Threaded accept loop — one thread per connection
     while (true) {
         const conn = posix.accept(sockfd, null, null, 0) catch |err| {
             log.warn("accept failed: {}", .{err});
             continue;
         };
 
-        // Set read timeout on accepted connection (5 seconds)
-        // Critical: SeaTidePool opens multiple simultaneous connections.
-        // Without a timeout, a blocking read on an idle connection
-        // prevents handling the connection that has the actual request.
-        const timeval = std.c.timeval{ .sec = 5, .usec = 0 };
-        posix.setsockopt(conn, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
-
-        // Per-request arena allocator — freed automatically after each request
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-
-        handleHttpRequest(arena.allocator(), conn, &parent_rpc, &aux_state) catch |err| {
-            log.warn("HTTP handler error: {}", .{err});
+        const thread = std.Thread.spawn(.{}, connectionThread, .{ conn, &shared }) catch |err| {
+            log.warn("thread spawn failed: {}, handling inline", .{err});
+            // Fallback: handle inline if thread creation fails
+            handleConnection(conn, &shared);
+            continue;
         };
-        posix.close(conn);
+        thread.detach();
     }
 }
 
-fn makeEvent(fd: posix.fd_t, filter: i16, flags: u16, udata: usize) posix.Kevent {
-    return .{
-        .ident = @intCast(fd),
-        .filter = filter,
-        .flags = flags,
-        .fflags = 0,
-        .data = 0,
-        .udata = udata,
-    };
+/// Per-connection thread entry point.
+fn connectionThread(conn: posix.socket_t, shared: *SharedState) void {
+    handleConnection(conn, shared);
 }
 
-fn acceptAndHandle(
-    allocator: std.mem.Allocator,
-    sockfd: posix.fd_t,
-    parent_rpc: *rpc.Client,
-    aux_state: *auxpow.State,
-) void {
-    while (true) {
-        const conn = posix.accept(sockfd, null, null, 0) catch |err| {
-            if (err == error.WouldBlock) break;
-            log.warn("accept failed: {}", .{err});
-            break;
-        };
+/// Handle a single connection: read request, dispatch, respond, close.
+fn handleConnection(conn: posix.socket_t, shared: *SharedState) void {
+    defer posix.close(conn);
 
-        handleHttpRequest(allocator, conn, parent_rpc, aux_state) catch |err| {
-            log.warn("HTTP handler error: {}", .{err});
-        };
-        posix.close(conn);
-    }
-}
+    // Per-request arena allocator — freed when this function returns
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
 
-fn refreshAuxTemplates(allocator: std.mem.Allocator, aux_state: *auxpow.State) void {
-    if (aux_state.chain_count() == 0) return;
-    aux_state.refreshTemplates(allocator) catch |err| {
-        log.warn("aux template refresh failed: {}", .{err});
+    handleHttpRequest(arena.allocator(), conn, shared) catch |err| {
+        log.warn("HTTP handler error: {}", .{err});
     };
 }
 
@@ -112,8 +87,7 @@ fn refreshAuxTemplates(allocator: std.mem.Allocator, aux_state: *auxpow.State) v
 fn handleHttpRequest(
     allocator: std.mem.Allocator,
     conn: posix.socket_t,
-    parent_rpc: *rpc.Client,
-    aux_state: *auxpow.State,
+    shared: *SharedState,
 ) !void {
     // Read HTTP request (heap-allocated — too large for stack)
     const buf = try allocator.alloc(u8, 256 * 1024); // 256KB max request
@@ -165,17 +139,23 @@ fn handleHttpRequest(
     const method = extractMethod(body);
 
     if (method) |m| {
-        if (std.mem.eql(u8, m, "getblocktemplate") and aux_state.chain_count() > 0) {
-            // Intercept only when aux chains configured; otherwise transparent proxy
-            const response_body = try handleGetBlockTemplate(allocator, body, parent_rpc, aux_state);
-            defer allocator.free(response_body);
-            try sendHttpResponse(conn, 200, response_body);
-            return;
+        if (std.mem.eql(u8, m, "getblocktemplate")) {
+            shared.mutex.lock();
+            defer shared.mutex.unlock();
+            if (shared.aux_state.chain_count() > 0) {
+                // Intercept only when aux chains configured; otherwise transparent proxy
+                const response_body = try handleGetBlockTemplate(allocator, body, &shared.parent_rpc, &shared.aux_state);
+                defer allocator.free(response_body);
+                try sendHttpResponse(conn, 200, response_body);
+                return;
+            }
         }
 
         if (std.mem.eql(u8, m, "submitauxblock")) {
+            shared.mutex.lock();
+            defer shared.mutex.unlock();
             // Custom method: handle aux block submission
-            const response_body = try handleSubmitAuxBlock(allocator, body, aux_state);
+            const response_body = try handleSubmitAuxBlock(allocator, body, &shared.aux_state);
             defer allocator.free(response_body);
             try sendHttpResponse(conn, 200, response_body);
             return;
@@ -183,8 +163,10 @@ fn handleHttpRequest(
     }
 
     // Default: transparent proxy to parent daemon
+    // No mutex needed — rpc.Client.httpPost creates a new TCP socket per call
+    // and only reads immutable config fields (host, port, user, pass)
     log.info("proxying {d}-byte request to parent daemon", .{body.len});
-    const response_body = try parent_rpc.rawCall(allocator, body);
+    const response_body = try shared.parent_rpc.rawCall(allocator, body);
     log.info("got {d}-byte response from parent, sending to client", .{response_body.len});
     defer allocator.free(response_body);
     try sendHttpResponse(conn, 200, response_body);
