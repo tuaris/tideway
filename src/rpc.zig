@@ -112,6 +112,12 @@ pub const Client = struct {
         return try self.callGetString(allocator, req);
     }
 
+    /// Forward a raw JSON-RPC request body to the daemon and return the raw response body.
+    /// Used by the HTTP proxy for transparent forwarding.
+    pub fn rawCall(self: *Client, allocator: std.mem.Allocator, request_body: []const u8) ![]const u8 {
+        return try self.httpPost(allocator, request_body);
+    }
+
     // --- Internal ---
 
     fn call(self: *Client, allocator: std.mem.Allocator, request: []const u8) !std.json.Parsed(std.json.Value) {

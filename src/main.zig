@@ -1,6 +1,6 @@
 const std = @import("std");
 const config = @import("config.zig");
-const socket = @import("socket.zig");
+const http = @import("http.zig");
 
 const log = std.log.scoped(.tideway);
 
@@ -40,11 +40,11 @@ pub fn main() !void {
 
     log.info("parent chain: {s}:{d}", .{ cfg.parent.host, cfg.parent.port });
     log.info("aux chains: {d} configured", .{cfg.aux_chains.len});
-    log.info("generator socket: {s}", .{cfg.socket_path});
+    log.info("listen: {s}", .{cfg.listen});
 
-    // Start the generator socket server
-    socket.serve(allocator, cfg) catch |err| {
-        log.err("generator socket server failed: {}", .{err});
+    // Start the HTTP JSON-RPC proxy server
+    http.serve(allocator, cfg) catch |err| {
+        log.err("HTTP proxy server failed: {}", .{err});
         std.process.exit(1);
     };
 }
@@ -68,7 +68,7 @@ pub const version = "0.1.0";
 test {
     // Import all modules for testing
     _ = @import("config.zig");
-    _ = @import("socket.zig");
+    _ = @import("http.zig");
     _ = @import("rpc.zig");
     _ = @import("auxpow.zig");
 }

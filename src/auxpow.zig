@@ -249,7 +249,7 @@ pub const State = struct {
 };
 
 /// Convert bytes to lowercase hex string.
-fn bytesToHex(bytes: []const u8, out: []u8) void {
+pub fn bytesToHex(bytes: []const u8, out: []u8) void {
     const hex_chars = "0123456789abcdef";
     for (bytes, 0..) |b, i| {
         out[i * 2] = hex_chars[b >> 4];

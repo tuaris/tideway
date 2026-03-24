@@ -19,8 +19,8 @@ pub const AuxChain = struct {
 };
 
 pub const Config = struct {
-    socket_path: []const u8,
-    zmq_pull: []const u8,
+    listen: []const u8,
+    zmq_pub: ?[]const u8,
 
     parent: struct {
         host: []const u8,
@@ -94,8 +94,8 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
     }
 
     return Config{
-        .socket_path = if (root.get("socket_path")) |s| s.string else "/tmp/ckpool/generator",
-        .zmq_pull = if (root.get("zmq_pull")) |s| s.string else "ipc:///tmp/ckpool/generator.zmq",
+        .listen = if (root.get("listen")) |s| s.string else "127.0.0.1:8332",
+        .zmq_pub = if (root.get("zmq_pub")) |s| s.string else null,
         .parent = .{
             .host = parent_host_port.host,
             .port = parent_host_port.port,
@@ -114,7 +114,7 @@ const HostPort = struct {
     port: u16,
 };
 
-fn parseUrl(url: []const u8) !HostPort {
+pub fn parseUrl(url: []const u8) !HostPort {
     // Parse "http://host:port" or "host:port"
     var remainder = url;
     if (std.mem.indexOf(u8, remainder, "://")) |idx| {
