@@ -1,123 +1,103 @@
-# Generator Unix Socket Protocol
+# HTTP JSON-RPC Proxy Protocol
 
-Tideway implements ckpool's generator Unix socket protocol. The stratifier sends newline-delimited text messages to the generator socket and reads a single-line response.
+Tideway is a transparent HTTP JSON-RPC proxy. The pool's generator connects to Tideway on its configured listen address and sends standard Bitcoin JSON-RPC requests over HTTP/1.1. Tideway forwards these to the parent chain daemon and returns the response.
 
-Each message is a short-lived connection: connect → send → read response → close.
+Each request is a short-lived HTTP connection (Connection: close).
 
-## Message Reference
+## Request Format
 
-### ping
+Standard HTTP POST with JSON-RPC body, identical to what the pool would send directly to the parent daemon:
 
-Health check. Used by the `extgen_poll` thread to detect when the external generator is ready.
+```
+POST / HTTP/1.1
+Host: 127.0.0.1:9332
+Content-Type: application/json
+Content-Length: 90
+Authorization: Basic <base64>
 
-**Request:** `ping`
-**Response:** `pong`
+{"method":"getblocktemplate","params":[{"capabilities":["coinbasetxn","workid","coinbase/append"],"rules":["segwit"]}]}
+```
 
-### getbase
+Tideway also accepts ckpool's non-standard `\n` line endings (instead of `\r\n`).
 
-Request a block template (equivalent to `getblocktemplate` + AuxPoW data).
+## Response Format
 
-**Request:** `getbase`
-**Response:** JSON object with standard GBT fields plus optional AuxPoW fields:
+Standard HTTP/1.1 response with JSON body. A trailing `\n` is appended to the body if not already present (required by ckpool's `read_socket_line()`).
+
+## Intercepted Methods
+
+### getblocktemplate
+
+When aux chains are configured, Tideway enriches the `getblocktemplate` response before returning it to the pool.
+
+**Enrichment:**
+
+1. The 44-byte AuxPoW commitment (hex-encoded) is appended to the `coinbaseaux.flags` value
+2. Aux chain metadata fields are added to the `result` object
+
+**Added fields:**
 
 ```json
 {
-  "previousblockhash": "00000000000000000002a7c4...",
-  "target": "0000000000000000000456...",
-  "version": 536870912,
-  "curtime": 1711234567,
-  "bits": "1a0fffff",
-  "height": 850000,
-  "coinbasevalue": 312500000,
-  "coinbaseaux": {"flags": ""},
-  "rules": ["csv", "segwit"],
-  "transactions": [...],
-  "diff": 12345678.90,
-  "ntime": "660e4f07",
-  "bbversion": "20000000",
-  "nbit": "1a0fffff",
+  "result": {
+    "coinbaseaux": {"flags": "<original_flags><auxpow_commitment_hex>"},
 
-  "aux_merkle_root": "a1b2c3d4e5f6...",
-  "aux_tree_size": 4,
-  "aux_tree_nonce": 0,
-  "n_aux_chains": 3,
-  "aux_chains": [
-    {
-      "chain_id": "dogecoin",
-      "hash": "...",
-      "target": "0000ffff00000000...",
-      "diff": 12345.678,
-      "slot": 0
-    }
-  ]
+    "aux_merkle_root": "a1b2c3d4e5f6...",
+    "aux_tree_size": 4,
+    "aux_tree_nonce": 0,
+    "n_aux_chains": 3,
+    "aux_chains": [
+      {
+        "chain_id": "dogecoin",
+        "hash": "...",
+        "target": "0000ffff00000000...",
+        "diff": 12345.678,
+        "slot": 0
+      }
+    ]
+  }
 }
 ```
 
-When no aux chains are configured, the `aux_*` fields are omitted (backward compatible with unpatched ckpool).
+When no aux chains are configured, the response passes through unmodified.
 
-### getbest
+The pool parses `coinbaseaux.flags` and includes it in the coinbase scriptsig as it normally would — the AuxPoW commitment is carried transparently via this standard GBT mechanism.
 
-Get the best (most recent) parent chain block hash.
+### submitauxblock
 
-**Request:** `getbest`
-**Response:** 64-character hex hash, or `notify` (if using ZMQ notifications), or `failed`
+Custom JSON-RPC method sent by the pool when a share meets an aux chain's target.
 
-### getlast
+**Request:**
 
-Get the latest parent chain block hash by height.
+```json
+{"method":"submitauxblock","params":["<chain_id>:<aux_hash>:<coinbase_hex>:<header_hex>:<nonce>"]}
+```
 
-**Request:** `getlast`
-**Response:** 64-character hex hash, or `failed`
+**Response:**
 
-### submitblock
+```json
+{"result":null,"error":null,"id":0}
+```
 
-Submit a solved parent chain block.
+Tideway constructs the full AuxPoW proof from the submitted data and forwards it to the appropriate aux chain daemon via `submitauxblock` RPC.
 
-**Request:** `submitblock:{block_hash}{separator}{block_hex_data}`
-**Response:** Sends `block:{hash}` or `noblock:{hash}` to the stratifier socket
+## Transparent Proxy Methods
 
-### checkaddr
+All other JSON-RPC methods pass through to the parent chain daemon without modification. Common methods used by ckpool's generator:
 
-Validate an address on the parent chain.
+| Method | Purpose |
+|--------|---------|
+| `getblockcount` | Block height polling |
+| `getblockhash` | Block hash by height |
+| `getbestblockhash` | Latest block hash |
+| `validateaddress` | Address validation |
+| `submitblock` | Parent block submission |
+| `testmempoolaccept` | Coinbase transaction check |
 
-**Request:** `checkaddr:{address}`
-**Response:** JSON object with `isvalid`, `isscript`, `iswitness` fields
+## Implementation Notes
 
-### checktxn
-
-Validate a transaction (coinbase check).
-
-**Request:** `checktxn:{transaction_hex}`
-**Response:** JSON result from `testmempoolaccept`
-
-### submitauxblock (NEW — merge mining)
-
-Submit an aux chain block solve. Sent via ZMQ PUSH (fire-and-forget) or Unix socket.
-
-**Request:** `submitauxblock:{chain_id}:{aux_hash}:{coinbase_hex}:{header_hex}:{nonce}`
-**Response:** None (fire-and-forget). Tideway constructs the AuxPoW proof internally and submits to the aux chain daemon.
-
-### reconnect
-
-Signal to refresh all daemon connections.
-
-**Request:** `reconnect`
-**Response:** None (fire-and-forget)
-
-### loglevel
-
-Set the log verbosity level.
-
-**Request:** `loglevel={N}`
-**Response:** None (fire-and-forget)
-
-## ZMQ PULL Socket
-
-In addition to the Unix socket, Tideway listens on a ZMQ PULL socket (default: `ipc:///tmp/ckpool/generator.zmq`) for fire-and-forget messages. This provides non-blocking, buffered delivery for:
-
-- `submitauxblock`
-- `submittxn`
-- `reconnect`
-- `loglevel`
-
-The ZMQ transport is preferred for these messages because it survives brief disconnections (messages are queued) and doesn't block the sender.
+- Tideway uses a **kqueue event loop** on the main thread for event-driven accept and timer-based aux template refresh
+- A **4-thread worker pool** processes requests concurrently (blocking I/O to parent daemon happens in worker threads)
+- The aux chain template refresh interval is configurable via `poll_interval_ms`
+- Request size limit: 256 KB
+- Response size limit from parent daemon: 4 MB

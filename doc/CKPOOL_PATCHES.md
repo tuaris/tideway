@@ -1,126 +1,64 @@
-# Patching ckpool for External Generator + AuxPoW
+# Patching ckpool/SeaTidePool for AuxPoW
 
-This guide walks through the ~153-line patch required to enable external generator support and merge mining (AuxPoW) in ckpool or SeaTidePool.
+This guide walks through the ~113-line patch required to add merge mining (AuxPoW) support to ckpool or SeaTidePool. These changes allow the pool to work with Tideway's enriched `getblocktemplate` responses.
 
-## Quick Apply
+Because Tideway is a transparent HTTP JSON-RPC proxy, no changes to `ckpool.c` or `ckpool.h` are needed. The pool's generator connects to Tideway as if it were the parent chain daemon — the only pool-side changes are parsing the aux fields, inserting the coinbase commitment, and checking aux targets at share time.
 
-```sh
-cd /path/to/ckpool
-patch -p1 < /path/to/tideway/patches/ckpool-auxpow.patch
-make clean && make
-```
+## Summary
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `src/auxpow.c` | +100 | New file: parse aux fields, insert coinbase commitment, check aux targets, submit aux solves |
+| `src/auxpow.h` | +53 | New file: `auxpow_t` struct, `aux_chain_t`, function prototypes |
+| `src/stratifier.c` | +5 | Three one-line calls to auxpow functions + buffer resize |
+| `src/stratifier.h` | +2 | Include `auxpow.h`, add `auxpow_t` field to workbase |
+| `src/generator.c` | +3 | `submitauxblock` handler in generator loop |
+| `Makefile` | +1 | Add `auxpow.o` to build |
+
+**Total:** ~113 new lines, only 11 lines in existing files.
 
 ## Manual Walkthrough
 
 ### 1. New Files: `src/auxpow.h` and `src/auxpow.c`
 
-These contain all merge mining logic — data structures, JSON parsing, coinbase commitment insertion, and aux target checking.
+These contain all merge mining logic — completely self-contained.
 
 **`src/auxpow.h`** defines:
-- `auxpow_t` — per-workbase merge mining state (Merkle root, tree metadata, per-chain info)
-- `aux_chain_t` — per-chain target/hash/difficulty
-- `auxpow_parse()` — parse optional aux fields from getbase JSON response
-- `auxpow_insert_commitment()` — write 44-byte AuxPoW marker into coinbase scriptsig
+- `AUXPOW_MAX_CHAINS` (32) — maximum aux chains (2^5 Merkle tree)
+- `AUXPOW_COMMITMENT_LEN` (44) — 4 magic + 32 root + 4 size + 4 nonce
+- `aux_chain_t` — per-chain state: chain_id, hash, target, difficulty, Merkle slot
+- `auxpow_t` — per-workbase merge mining state (n_chains, Merkle root, tree metadata, chain array)
+- `auxpow_parse()` — parse optional aux fields from getblocktemplate JSON
+- `auxpow_insert_commitment()` — write 44-byte AuxPoW commitment into coinbase scriptsig
 - `auxpow_check_targets()` — compare share difficulty against all aux chain targets
 
-**`src/auxpow.c`** implements these functions plus a static `submit_aux_block()` helper.
+**`src/auxpow.c`** implements:
+- `auxpow_parse()` — extracts `aux_chains`, `aux_merkle_root`, `aux_tree_size`, `aux_tree_nonce` from the GBT JSON (added by Tideway). Safe no-op when aux fields are absent.
+- `auxpow_insert_commitment()` — writes the 44-byte blob (`0xfabe6d6d` + Merkle root + tree_size LE + tree_nonce LE) into the coinbase scriptsig at the current offset. No-op when n_chains == 0.
+- `auxpow_check_targets()` — iterates all aux chains, compares share difficulty against each target. On match, calls `submit_aux_block()`.
+- `submit_aux_block()` (static) — formats the `submitauxblock` message with chain_id, aux hash, coinbase hex, parent header hex, and nonce, then sends it to the generator via `send_proc()`. The generator forwards it to Tideway, which constructs the AuxPoW proof and submits to the aux daemon.
 
-### 2. `src/ckpool.h` (+5 lines)
-
-Add to `struct ckpool_instance`:
-
-```c
-bool external_generator;   /* Use external generator process (e.g., Tideway) */
-void *zmq_gen_push;        /* ZMQ PUSH socket to external generator */
-```
-
-### 3. `src/ckpool.c` (+45 lines)
-
-#### Config parsing (in `read_config()`)
-
-```c
-json_get_bool(&ckp->external_generator, json_conf, "external_generator");
-```
-
-#### Startup (in `main()`, replacing `prepare_child` for generator)
-
-```c
-if (ckp.external_generator) {
-    /* Set up socket path for send_recv_proc() */
-    ckp.generator.ckp = &ckp;
-    ckp.generator.processname = "generator";
-    ckp.generator.sockname = ckp.generator.processname;
-    name_process_sockname(&ckp.generator.us, &ckp.generator);
-
-    /* ZMQ PUSH for fire-and-forget messages */
-    ckp.zmq_gen_push = zmq_socket(ckp.zmqctx, ZMQ_PUSH);
-    zmq_connect(ckp.zmq_gen_push, "ipc:///tmp/ckpool/generator.zmq");
-
-    /* Poll thread sets generator_ready when external generator responds */
-    create_pthread(&pth_extgen, extgen_poll, &ckp);
-} else {
-    prepare_child(&ckp, &ckp.generator, generator, "generator");
-}
-```
-
-#### External generator poll thread
-
-```c
-static void *extgen_poll(void *arg)
-{
-    ckpool_t *ckp = (ckpool_t *)arg;
-
-    rename_proc("extgenpoll");
-    while (!ckp->generator_ready) {
-        char *resp = send_recv_proc(ckp->generator, "ping");
-        if (resp && !strcmp(resp, "pong")) {
-            ckp->generator_ready = true;
-            LOGWARNING("External generator ready");
-        } else {
-            LOGDEBUG("Waiting for external generator on %s...",
-                     ckp->generator.us.path);
-        }
-        dealloc(resp);
-        if (!ckp->generator_ready)
-            cksleep_ms(1000);
-    }
-    return NULL;
-}
-```
-
-#### send_proc wrapper (in `_queue_proc()`)
-
-Route fire-and-forget messages through ZMQ when targeting the external generator:
-
-```c
-if (ckp->external_generator && pi == &ckp->generator) {
-    zmq_send(ckp->zmq_gen_push, msg, strlen(msg), ZMQ_DONTWAIT);
-    return;
-}
-/* ... original _queue_proc code ... */
-```
-
-### 4. `src/stratifier.h` (+2 lines)
+### 2. `src/stratifier.h` (+2 lines)
 
 ```c
 #include "auxpow.h"
 ```
 
-Add inside `struct genwork`:
+Add `auxpow_t` field inside `struct workbase`:
 
 ```c
-auxpow_t auxpow;
+auxpow_t auxpow; /* Merge mining state (zero when not merge mining) */
 ```
 
-### 5. `src/stratifier.c` (+5 lines)
+### 3. `src/stratifier.c` (+5 lines)
 
 Three one-line call sites and a buffer resize:
 
 ```c
-/* In update_base() / add_base(), after existing gbtbase parsing: */
-auxpow_parse(&wb->auxpow, gbt->json);
+/* After witness data check, before generate_coinbase(): */
+auxpow_parse(&wb->auxpow, wb->json);
 
-/* In generate_coinbase(), after timestamp/random, before enonce length: */
+/* In generate_coinbase(), after flags, before enonce length byte: */
 auxpow_insert_commitment(&wb->auxpow, wb->coinb1bin, &ofs);
 
 /* After algo_share_diff(), before test_blocksolve(): */
@@ -135,17 +73,27 @@ wb->coinb1 = ckzalloc(512);    /* was 256 */
 wb->coinb1bin = ckzalloc(256); /* was 128 */
 ```
 
-### 6. `Makefile` (+1 line)
+### 4. `src/generator.c` (+3 lines)
+
+Add a `submitauxblock` handler in the generator's message loop to forward aux block submissions to the parent daemon (Tideway):
+
+```c
+if (!strncmp(buf, "submitauxblock:", 15)) {
+    send_json_rpc(/* ... submitauxblock params ... */);
+}
+```
+
+### 5. `Makefile` (+1 line)
 
 Add `auxpow.o` to the object list.
 
 ## Verification
 
-After patching, build and run without `external_generator` to verify no regressions:
+After patching, build and run without aux chains to verify no regressions:
 
 ```sh
 make clean && make
 ./tidepoold -c your-existing-config.conf
 ```
 
-The patch is backward compatible — without `"external_generator": true` in the config, ckpool behaves exactly as before.
+The patch is backward compatible — when Tideway is not in front of the daemon (or has no aux chains configured), `auxpow_parse()` finds no aux fields in the GBT response and all three call sites are safe no-ops.

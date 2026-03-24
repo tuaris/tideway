@@ -1,13 +1,11 @@
 {
-  "socket_path": "/tmp/ckpool/generator",
-  "zmq_pull": "ipc:///tmp/ckpool/generator.zmq",
+  "listen": "127.0.0.1:9332",
 
   "parent": {
-    "url": "http://127.0.0.1:9332",
+    "url": "http://127.0.0.1:19332",
     "user": "litecoinrpc",
     "pass": "password",
-    "poll_interval_ms": 100,
-    "zmq_hashblock": "tcp://127.0.0.1:28332"
+    "poll_interval_ms": 100
   },
 
   "aux_chains": [

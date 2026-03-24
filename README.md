@@ -1,41 +1,46 @@
 # Tideway
 
-Tideway is a merge mining (AuxPoW) generator for [ckpool](https://bitbucket.org/ckolivas/ckpool)-based mining pools. It replaces ckpool's internal generator thread with an external process that connects to a parent chain daemon plus multiple auxiliary chain daemons, enabling N-way merged mining over Unix sockets.
+Tideway is a merge mining (AuxPoW) proxy for [ckpool](https://bitbucket.org/ckolivas/ckpool)-based mining pools. It sits between the pool's generator and the parent chain daemon as a transparent HTTP JSON-RPC proxy, enriching block templates with auxiliary chain data to enable N-way merged mining.
 
 ## How It Works
 
 ```
-┌──────────────────────────┐
-│  ckpool / SeaTidePool    │
-│  Connector ◄─► Stratifier│──[Unix socket]──► /tmp/ckpool/generator
-└──────────────────────────┘                          │
-                                              ┌───────┴───────┐
-                                              │   Tideway      │
-                                              │                │
-                                              │  Parent Daemon │──► litecoind
-                                              │  Aux Daemons   │──► dogecoind
-                                              │                │──► pepecoind
-                                              │  AuxPoW Merkle │──► bellsd
-                                              └────────────────┘
+                          ┌─────────────┐
+                          │  litecoind  │  Parent chain daemon
+                          └──────▲──────┘
+                                 │  JSON-RPC
+                          ┌──────┴──────┐
+                          │   Tideway   │  Merge mining proxy
+                          │             │
+                          │  ┌────────┐ │──► dogecoind
+                          │  │ AuxPoW │ │──► pepecoind
+                          │  │ Merkle │ │──► bellsd
+                          │  └────────┘ │
+                          └──────▲──────┘
+                                 │  JSON-RPC (transparent)
+                          ┌──────┴──────┐
+                          │ SeaTidePool │  Mining pool
+                          │  Generator  │
+                          └──────▲──────┘
+                                 │  Stratum
+                          ┌──────┴──────┐
+                          │   Miners    │
+                          └─────────────┘
 ```
 
-Tideway implements ckpool's generator Unix socket protocol. It:
+The pool's generator connects to Tideway thinking it is the parent chain daemon (e.g., litecoind). Tideway transparently proxies all JSON-RPC calls, intercepting two methods:
 
-1. Listens on the generator socket (e.g., `/tmp/ckpool/generator`)
-2. Handles `getbase` requests by fetching block templates from the parent chain daemon and all configured aux chain daemons
-3. Builds an AuxPoW Merkle tree from aux chain block hashes and includes the commitment in the response
-4. Handles `submitblock` for parent chain block solves
-5. Handles `submitauxblock` for aux chain block solves (constructs AuxPoW proofs and submits to aux daemons)
-6. Exposes a ZMQ PULL socket for fire-and-forget messages (reconnect, loglevel, etc.)
+1. **`getblocktemplate`** — forwarded to the parent daemon, then enriched with AuxPoW commitment data (Merkle root of aux chain block hashes injected into `coinbaseaux.flags`) and aux chain metadata before returning to the pool
+2. **`submitauxblock`** — constructs AuxPoW proofs and submits solved aux blocks to aux chain daemons
 
-Miners are unaware of merge mining — they receive standard Stratum work and submit shares normally.
+All other RPCs (`getblockcount`, `validateaddress`, `submitblock`, etc.) pass through unmodified. Miners are unaware of merge mining — they receive standard Stratum work and submit shares normally.
 
 ## Requirements
 
 - [Zig](https://ziglang.org/) 0.15+ (build)
 - Parent chain daemon (bitcoind, litecoind, etc.) with RPC enabled
 - Aux chain daemons with `getauxblock` or `createauxblock` RPC support
-- [SeaTidePool](https://git.morante.net/TidePool/SeaTidePool) (has native external generator support), or ckpool with patches applied (see [Patching ckpool](#patching-ckpool))
+- [SeaTidePool](https://git.morante.net/TidePool/SeaTidePool) with AuxPoW support, or ckpool with patches applied (see [Pool Compatibility](#pool-compatibility))
 
 ## Building
 
@@ -65,13 +70,11 @@ See [doc/CONFIGURATION.md](doc/CONFIGURATION.md) for full reference.
 
 ```json
 {
-  "socket_path": "/tmp/ckpool/generator",
-  "zmq_pull": "ipc:///tmp/ckpool/generator.zmq",
+  "listen": "127.0.0.1:9332",
   "parent": {
-    "url": "http://127.0.0.1:9332",
+    "url": "http://127.0.0.1:19332",
     "user": "litecoinrpc",
-    "pass": "password",
-    "poll_interval_ms": 100
+    "pass": "password"
   },
   "aux_chains": [
     {
@@ -87,50 +90,43 @@ See [doc/CONFIGURATION.md](doc/CONFIGURATION.md) for full reference.
 ## Running
 
 ```sh
-# Start Tideway (creates generator socket)
+# Start Tideway (listens for HTTP JSON-RPC connections)
 ./tideway -c tideway.conf
 
-# Start ckpool/SeaTidePool with external generator enabled
+# Point the pool's btcd URL at Tideway instead of the parent daemon
 ./tidepoold -c tidepool.conf
 ```
 
-Either service can start first — ckpool polls the generator socket until Tideway responds.
+In the pool config, set the `btcd` URL to Tideway's listen address. The pool's generator connects to Tideway as if it were the parent chain daemon.
 
 ## Pool Compatibility
 
 ### SeaTidePool
 
-SeaTidePool has **native external generator support** — no patches required. Add `"external_generator": true` to your SeaTidePool config and start Tideway.
+SeaTidePool requires a small patch (~113 lines) to parse aux fields from the enriched `getblocktemplate` response, insert the AuxPoW commitment into the coinbase, and check aux chain targets at share time. No changes to the pool's core architecture — the generator runs normally, connecting to Tideway via its standard `btcd` URL.
+
+See [doc/CKPOOL_PATCHES.md](doc/CKPOOL_PATCHES.md) for a detailed walkthrough.
+
+**Summary of changes:**
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `src/auxpow.c` | +100 | New file: parse aux fields, insert coinbase commitment, check aux targets, submit aux solves |
+| `src/auxpow.h` | +53 | New file: `auxpow_t` struct, `aux_chain_t`, function prototypes |
+| `src/stratifier.c` | +5 | Three one-line calls to auxpow functions + buffer resize |
+| `src/stratifier.h` | +2 | Include `auxpow.h`, add `auxpow_t` field to workbase |
+| `src/generator.c` | +3 | `submitauxblock` handler in generator loop |
+| `Makefile` | +1 | Add `auxpow.o` to build |
 
 ### ckpool
 
-Upstream ckpool requires a small patch to enable external generator support and AuxPoW coinbase commitments (~260 lines across 7 files).
+The same patch applies to upstream ckpool. No changes to `ckpool.c` or `ckpool.h` are required — the proxy approach means the generator runs unmodified.
 
-**Quick apply:**
+## Documentation
 
-```sh
-cd /path/to/ckpool
-patch -p1 < /path/to/tideway/patches/ckpool-auxpow.patch
-make clean && make
-```
-
-See [doc/CKPOOL_PATCHES.md](doc/CKPOOL_PATCHES.md) for a detailed walkthrough of each change.
-
-**Summary of patch:**
-
-| File | Lines | Purpose |
-|------|-------|--------|
-| `src/ckpool.c` | +45 | External generator config, poll thread, ZMQ PUSH init, send_proc wrapper |
-| `src/ckpool.h` | +5 | `external_generator` flag, `zmq_gen_push` pointer |
-| `src/auxpow.c` | +65 | New file: parse aux fields, insert coinbase commitment, check aux targets |
-| `src/auxpow.h` | +30 | New file: `auxpow_t` struct, `aux_chain_t`, function prototypes |
-| `src/stratifier.c` | +5 | Three one-line calls to auxpow functions + buffer resize |
-| `src/stratifier.h` | +2 | Include `auxpow.h`, add `auxpow_t` field to workbase |
-| `Makefile` | +1 | Add `auxpow.o` to build |
-
-## Protocol
-
-Tideway implements ckpool's generator Unix socket protocol. See [doc/PROTOCOL.md](doc/PROTOCOL.md) for the full message reference.
+- [doc/MERGE_MINING.md](doc/MERGE_MINING.md) — How merge mining (AuxPoW) works and how Tideway fits in
+- [doc/CONFIGURATION.md](doc/CONFIGURATION.md) — Configuration file reference
+- [doc/CKPOOL_PATCHES.md](doc/CKPOOL_PATCHES.md) — Pool-side patch walkthrough
 
 ## License
 

@@ -6,22 +6,24 @@ Tideway reads a JSON configuration file (default: `tideway.conf`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `socket_path` | string | `/tmp/ckpool/generator` | Path for the generator Unix domain socket |
-| `zmq_pull` | string | `ipc:///tmp/ckpool/generator.zmq` | ZMQ PULL endpoint for fire-and-forget messages |
+| `listen` | string | `"127.0.0.1:8332"` | HTTP listen address and port for the JSON-RPC proxy |
+| `zmq_pub` | string | null | ZMQ PUB endpoint for unified block notifications (not yet implemented) |
 
 ## Parent Chain (`parent`)
+
+The parent chain daemon that Tideway proxies requests to.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `url` | string | **required** | JSON-RPC URL (e.g., `http://127.0.0.1:9332`) |
 | `user` | string | `""` | RPC username |
 | `pass` | string | `""` | RPC password |
-| `poll_interval_ms` | integer | `100` | Block polling interval in milliseconds |
-| `zmq_hashblock` | string | null | ZMQ endpoint for block notifications (e.g., `tcp://127.0.0.1:28332`) |
+| `poll_interval_ms` | integer | `100` | Aux chain template refresh interval in milliseconds (kqueue timer) |
+| `zmq_hashblock` | string | null | ZMQ endpoint for block notifications (not yet implemented) |
 
 ## Auxiliary Chains (`aux_chains`)
 
-Array of aux chain daemon configurations.
+Array of aux chain daemon configurations. When this array is non-empty, Tideway enriches `getblocktemplate` responses with AuxPoW data.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -35,15 +37,13 @@ Array of aux chain daemon configurations.
 
 ```json
 {
-  "socket_path": "/tmp/ckpool/generator",
-  "zmq_pull": "ipc:///tmp/ckpool/generator.zmq",
+  "listen": "127.0.0.1:9332",
 
   "parent": {
-    "url": "http://127.0.0.1:9332",
+    "url": "http://127.0.0.1:19332",
     "user": "litecoinrpc",
     "pass": "password",
-    "poll_interval_ms": 100,
-    "zmq_hashblock": "tcp://127.0.0.1:28332"
+    "poll_interval_ms": 100
   },
 
   "aux_chains": [
@@ -70,15 +70,18 @@ Array of aux chain daemon configurations.
 }
 ```
 
-## ckpool Configuration
+## Pool Configuration
 
-When using Tideway with ckpool/SeaTidePool, add this to the pool config:
+Point the pool's `btcd` URL at Tideway's listen address instead of the parent daemon. For SeaTidePool / ckpool:
 
 ```json
 {
-  "external_generator": true,
-  ...
+  "btcd": [{
+    "url": "127.0.0.1:9332",
+    "auth": "litecoinrpc",
+    "pass": "password"
+  }]
 }
 ```
 
-This tells ckpool to skip spawning its internal generator thread and instead communicate with Tideway over the Unix socket.
+Tideway is transparent — the pool's generator connects to it as if it were the parent chain daemon. No special pool configuration flags are needed.
