@@ -6,6 +6,21 @@ const auxpow = @import("auxpow.zig");
 
 const log = std.log.scoped(.http);
 
+// --- kqueue filter constants (FreeBSD stable ABI) ---
+const EVFILT_READ: i16 = -1;
+const EVFILT_TIMER: i16 = -7;
+const EV_ADD: u16 = 0x0001;
+const EV_ENABLE: u16 = 0x0004;
+const NOTE_MSECONDS: u32 = 0x00000002;
+
+// --- Event identification via udata ---
+const UDATA_LISTENER: usize = 0;
+const UDATA_AUX_TIMER: usize = 1;
+
+// --- Worker pool sizing ---
+const WORKER_COUNT: usize = 4;
+const JOB_QUEUE_CAPACITY: usize = 64;
+
 /// Shared proxy state protected by a mutex for thread-safe access.
 const SharedState = struct {
     parent_rpc: rpc.Client,
@@ -13,10 +28,75 @@ const SharedState = struct {
     mutex: std.Thread.Mutex = .{},
 };
 
+/// A unit of work: one accepted TCP connection.
+const Job = struct {
+    conn: posix.socket_t,
+};
+
+/// Bounded FIFO queue with blocking pop via condition variable.
+const JobQueue = struct {
+    mutex: std.Thread.Mutex = .{},
+    not_empty: std.Thread.Condition = .{},
+    buf: [JOB_QUEUE_CAPACITY]Job = undefined,
+    head: usize = 0,
+    tail: usize = 0,
+    count: usize = 0,
+
+    fn push(self: *JobQueue, job: Job) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.count == JOB_QUEUE_CAPACITY) {
+            log.warn("job queue full, dropping connection", .{});
+            posix.close(job.conn);
+            return;
+        }
+        self.buf[self.tail] = job;
+        self.tail = (self.tail + 1) % JOB_QUEUE_CAPACITY;
+        self.count += 1;
+        self.not_empty.signal();
+    }
+
+    fn pop(self: *JobQueue) Job {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.count == 0) {
+            self.not_empty.wait(&self.mutex);
+        }
+        const job = self.buf[self.head];
+        self.head = (self.head + 1) % JOB_QUEUE_CAPACITY;
+        self.count -= 1;
+        return job;
+    }
+};
+
+/// Fixed-size thread pool that processes accepted connections.
+const WorkerPool = struct {
+    threads: [WORKER_COUNT]std.Thread = undefined,
+    queue: JobQueue = .{},
+    shared: *SharedState,
+
+    fn start(self: *WorkerPool) !void {
+        for (&self.threads) |*t| {
+            t.* = try std.Thread.spawn(.{}, workerLoop, .{self});
+        }
+        log.info("worker pool: {d} threads started", .{WORKER_COUNT});
+    }
+
+    fn submit(self: *WorkerPool, conn: posix.socket_t) void {
+        self.queue.push(.{ .conn = conn });
+    }
+
+    fn workerLoop(pool: *WorkerPool) void {
+        while (true) {
+            const job = pool.queue.pop();
+            handleConnection(job.conn, pool.shared);
+        }
+    }
+};
+
 /// HTTP JSON-RPC proxy server.
-/// Sits between SeaTidePool's generator and the parent chain daemon.
-/// Transparently proxies all RPCs, intercepting getblocktemplate to enrich
-/// with aux chain data and submitauxblock for merge mining block submission.
+/// Uses kqueue for event-driven accept + periodic aux refresh timer.
+/// Worker thread pool handles blocking request processing.
 pub fn serve(allocator: std.mem.Allocator, cfg: config.Config) !void {
     // Parse listen address
     const listen_hp = config.parseUrl(cfg.listen) catch {
@@ -24,7 +104,7 @@ pub fn serve(allocator: std.mem.Allocator, cfg: config.Config) !void {
         return error.InvalidListenAddress;
     };
 
-    // Create TCP listener with direct IPv4 bind
+    // Create TCP listener
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(sockfd);
 
@@ -37,7 +117,7 @@ pub fn serve(allocator: std.mem.Allocator, cfg: config.Config) !void {
 
     log.info("HTTP JSON-RPC proxy listening on {s}:{d}", .{ listen_hp.host, listen_hp.port });
 
-    // Initialize shared state (parent RPC client + aux chain state)
+    // Initialize shared state (parent RPC + aux chains)
     var shared = SharedState{
         .parent_rpc = rpc.Client.init(allocator, cfg.parent.host, cfg.parent.port, cfg.parent.user, cfg.parent.pass),
         .aux_state = auxpow.State.init(allocator, cfg.aux_chains),
@@ -45,28 +125,94 @@ pub fn serve(allocator: std.mem.Allocator, cfg: config.Config) !void {
     defer shared.parent_rpc.deinit();
     defer shared.aux_state.deinit();
 
-    log.info("threaded accept loop started (aux_chains={d})", .{shared.aux_state.chain_count()});
+    // Start worker thread pool
+    var pool = WorkerPool{ .shared = &shared };
+    try pool.start();
 
-    // Threaded accept loop — one thread per connection
+    // Create kqueue and register events
+    const kq = try posix.kqueue();
+    defer posix.close(kq);
+
+    var changelist: [2]posix.Kevent = undefined;
+    var n_changes: usize = 0;
+
+    // Watch listener socket for incoming connections
+    changelist[n_changes] = makeEvent(sockfd, EVFILT_READ, EV_ADD | EV_ENABLE, UDATA_LISTENER);
+    n_changes += 1;
+
+    // Periodic aux chain template refresh timer
+    if (shared.aux_state.chain_count() > 0) {
+        changelist[n_changes] = makeTimerEvent(
+            UDATA_AUX_TIMER,
+            cfg.parent.poll_interval_ms,
+            EV_ADD | EV_ENABLE,
+        );
+        n_changes += 1;
+    }
+
+    // Apply registrations (empty eventlist = return immediately)
+    _ = try posix.kevent(kq, changelist[0..n_changes], &[0]posix.Kevent{}, null);
+
+    log.info("kqueue event loop started (workers={d}, aux_chains={d})", .{
+        WORKER_COUNT,
+        shared.aux_state.chain_count(),
+    });
+
+    // Main event loop — single thread, no blocking I/O
+    var eventlist: [16]posix.Kevent = undefined;
     while (true) {
-        const conn = posix.accept(sockfd, null, null, 0) catch |err| {
-            log.warn("accept failed: {}", .{err});
+        const n_events = posix.kevent(kq, &[0]posix.Kevent{}, &eventlist, null) catch |err| {
+            log.warn("kevent failed: {}", .{err});
             continue;
         };
 
-        const thread = std.Thread.spawn(.{}, connectionThread, .{ conn, &shared }) catch |err| {
-            log.warn("thread spawn failed: {}, handling inline", .{err});
-            // Fallback: handle inline if thread creation fails
-            handleConnection(conn, &shared);
-            continue;
-        };
-        thread.detach();
+        for (eventlist[0..n_events]) |ev| {
+            switch (ev.udata) {
+                UDATA_LISTENER => {
+                    // Accept pending connections (ev.data = backlog count)
+                    var i: isize = 0;
+                    while (i < ev.data) : (i += 1) {
+                        const conn = posix.accept(sockfd, null, null, 0) catch |err| {
+                            log.warn("accept failed: {}", .{err});
+                            break;
+                        };
+                        pool.submit(conn);
+                    }
+                },
+                UDATA_AUX_TIMER => {
+                    // Refresh aux chain block templates on timer tick
+                    shared.mutex.lock();
+                    defer shared.mutex.unlock();
+                    shared.aux_state.refreshTemplates(allocator) catch |err| {
+                        log.warn("aux template refresh failed: {}", .{err});
+                    };
+                },
+                else => {},
+            }
+        }
     }
 }
 
-/// Per-connection thread entry point.
-fn connectionThread(conn: posix.socket_t, shared: *SharedState) void {
-    handleConnection(conn, shared);
+fn makeEvent(fd: posix.fd_t, filter: i16, flags: u16, udata: usize) posix.Kevent {
+    return .{
+        .ident = @intCast(fd),
+        .filter = filter,
+        .flags = flags,
+        .fflags = 0,
+        .data = 0,
+        .udata = udata,
+    };
+}
+
+fn makeTimerEvent(ident: usize, interval_ms: u32, flags: u16) posix.Kevent {
+    return .{
+        .ident = ident,
+        .filter = EVFILT_TIMER,
+        .flags = flags,
+        .fflags = NOTE_MSECONDS,
+        .data = @intCast(interval_ms),
+        .udata = ident,
+    };
 }
 
 /// Handle a single connection: read request, dispatch, respond, close.
