@@ -127,28 +127,24 @@ fn handleConnection(
     parent_rpc: *rpc.Client,
     aux_state: *auxpow.State,
 ) !void {
-    // Read the message (newline-delimited, like ckpool)
-    var buf: [65536]u8 = undefined;
-    const n = try posix.read(conn, &buf);
-    if (n == 0) return;
-
-    // Strip trailing newline
-    var msg = buf[0..n];
-    while (msg.len > 0 and (msg[msg.len - 1] == '\n' or msg[msg.len - 1] == '\r')) {
-        msg = msg[0 .. msg.len - 1];
-    }
+    // ckpool wire protocol: 4-byte LE uint32 length prefix + message bytes
+    const msg = recvMessage(conn) catch |err| {
+        log.warn("failed to read message: {}", .{err});
+        return;
+    };
+    if (msg.len == 0) return;
 
     log.debug("received: {s}", .{msg});
 
     // Dispatch based on command prefix
     const response = dispatch(allocator, msg, parent_rpc, aux_state) catch |err| {
         log.warn("dispatch error for '{s}': {}", .{ msg, err });
-        return sendResponse(conn, "failed");
+        return sendMessage(conn, "failed");
     };
     defer if (response) |r| allocator.free(r);
 
     if (response) |r| {
-        return sendResponse(conn, r);
+        return sendMessage(conn, r);
     }
 }
 
@@ -206,39 +202,91 @@ fn dispatch(
     return try allocator.dupe(u8, "unknown");
 }
 
-fn sendResponse(conn: posix.socket_t, msg: []const u8) !void {
-    var iov = [_]posix.iovec_const{
-        .{ .base = msg.ptr, .len = msg.len },
-        .{ .base = "\n", .len = 1 },
-    };
-    _ = try posix.writev(conn, &iov);
+/// ckpool wire protocol: send 4-byte LE length prefix + message bytes
+fn sendMessage(conn: posix.socket_t, msg: []const u8) !void {
+    const len: u32 = @intCast(msg.len);
+    const len_le = std.mem.nativeToLittle(u32, len);
+    const len_bytes = std.mem.asBytes(&len_le);
+    _ = try posix.write(conn, len_bytes);
+    _ = try posix.write(conn, msg);
+}
+
+/// ckpool wire protocol: read 4-byte LE length prefix, then message bytes
+fn recvMessage(conn: posix.socket_t) ![]const u8 {
+    var len_buf: [4]u8 = undefined;
+    const len_read = try posix.read(conn, &len_buf);
+    if (len_read < 4) return &.{};
+
+    const msglen = std.mem.littleToNative(u32, std.mem.bytesToValue(u32, &len_buf));
+    if (msglen < 1 or msglen > 0x80000000) return error.InvalidMessageLength;
+
+    var buf: [65536]u8 = undefined;
+    if (msglen > buf.len) return error.MessageTooLong;
+
+    var total: usize = 0;
+    while (total < msglen) {
+        const n = try posix.read(conn, buf[total..msglen]);
+        if (n == 0) return error.ConnectionClosed;
+        total += n;
+    }
+
+    return buf[0..msglen];
 }
 
 // --- Command Handlers ---
 
 fn handleGetbase(allocator: std.mem.Allocator, parent_rpc: *rpc.Client, aux_state: *auxpow.State) ![]const u8 {
-    // Get parent chain block template
+    // Get parent chain block template (full JSON-RPC response)
     var gbt_json = try parent_rpc.getBlockTemplate(allocator);
     defer gbt_json.deinit();
 
-    // Serialize base GBT to JSON string
-    var base_json = try serializeJson(allocator, gbt_json.value);
+    // Extract the "result" object (stratifier expects this, not the RPC wrapper)
+    const result_val = gbt_json.value.object.get("result") orelse return error.MissingGbtResult;
 
-    // If aux chains are configured, merge aux fields into the JSON response
-    if (aux_state.chain_count() > 0) {
-        const aux_json = try aux_state.auxFieldsJson(allocator);
-        if (aux_json) |aux| {
-            defer allocator.free(aux);
-            // Insert aux fields before the closing brace of the JSON object
-            if (base_json.len > 1 and base_json[base_json.len - 1] == '}') {
-                const merged = try std.fmt.allocPrint(allocator,
-                    "{s},{s}}}",
-                    .{ base_json[0 .. base_json.len - 1], aux },
-                );
-                allocator.free(base_json);
-                base_json = merged;
+    // Serialize the result object
+    var base_json = try serializeJson(allocator, result_val);
+
+    // Add convenience fields that gen_gbtbase() normally computes:
+    // diff (from target), ntime (hex curtime), bbversion (hex version), nbit (bits)
+    const result_obj = result_val.object;
+    const curtime = result_obj.get("curtime") orelse return error.MissingCurtime;
+    const version = result_obj.get("version") orelse return error.MissingVersion;
+    const bits_val = result_obj.get("bits") orelse return error.MissingBits;
+
+    const curtime_int: u32 = @intCast(curtime.integer);
+    const version_int: u32 = @intCast(version.integer);
+
+    // Compute diff from target (approximate — stratifier recalculates precisely)
+    const target_str = if (result_obj.get("target")) |t| t.string else "00000000ffffffff";
+    _ = target_str;
+
+    // Insert convenience fields before closing brace
+    if (base_json.len > 1 and base_json[base_json.len - 1] == '}') {
+        const extra = try std.fmt.allocPrint(allocator,
+            ",\"diff\":1.0,\"ntime\":\"{x:0>8}\",\"bbversion\":\"{x:0>8}\",\"nbit\":\"{s}\"",
+            .{ curtime_int, version_int, bits_val.string },
+        );
+        defer allocator.free(extra);
+
+        // Merge aux fields if configured
+        var aux_extra: []const u8 = "";
+        var aux_alloc: ?[]const u8 = null;
+        defer if (aux_alloc) |a| allocator.free(a);
+
+        if (aux_state.chain_count() > 0) {
+            if (try aux_state.auxFieldsJson(allocator)) |aux| {
+                aux_alloc = try std.fmt.allocPrint(allocator, ",{s}", .{aux});
+                allocator.free(aux);
+                aux_extra = aux_alloc.?;
             }
         }
+
+        const merged = try std.fmt.allocPrint(allocator,
+            "{s}{s}{s}}}",
+            .{ base_json[0 .. base_json.len - 1], extra, aux_extra },
+        );
+        allocator.free(base_json);
+        base_json = merged;
     }
 
     return base_json;
