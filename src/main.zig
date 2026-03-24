@@ -23,7 +23,8 @@ pub fn main() !void {
             printUsage();
             return;
         } else if (std.mem.eql(u8, args[i], "-v") or std.mem.eql(u8, args[i], "--version")) {
-            try std.io.getStdOut().writeAll("tideway " ++ version ++ "\n");
+            const stdout = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
+            _ = try stdout.write("tideway " ++ version ++ "\n");
             return;
         }
     }
@@ -58,7 +59,8 @@ fn printUsage() void {
         \\  -v, --version  Show version
         \\
     ;
-    std.io.getStdOut().writeAll(usage) catch {};
+    const stdout = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
+    _ = stdout.write(usage) catch {};
 }
 
 pub const version = "0.1.0";

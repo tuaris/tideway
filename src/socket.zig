@@ -101,7 +101,7 @@ fn acceptAndHandle(
 ) void {
     // Accept all pending connections (non-blocking socket)
     while (true) {
-        const conn = posix.accept(sockfd, null, null) catch |err| {
+        const conn = posix.accept(sockfd, null, null, 0) catch |err| {
             if (err == error.WouldBlock) break;
             log.warn("accept failed: {}", .{err});
             break;
@@ -197,7 +197,7 @@ fn dispatch(
     }
 
     if (std.mem.eql(u8, msg, "reconnect")) {
-        log.info("reconnect requested — refreshing daemon connections");
+        log.info("reconnect requested — refreshing daemon connections", .{});
         parent_rpc.reconnect();
         return null;
     }
@@ -221,14 +221,27 @@ fn handleGetbase(allocator: std.mem.Allocator, parent_rpc: *rpc.Client, aux_stat
     var gbt_json = try parent_rpc.getBlockTemplate(allocator);
     defer gbt_json.deinit();
 
-    // If aux chains are configured, fetch aux templates and add AuxPoW fields
+    // Serialize base GBT to JSON string
+    var base_json = try serializeJson(allocator, gbt_json.value);
+
+    // If aux chains are configured, merge aux fields into the JSON response
     if (aux_state.chain_count() > 0) {
-        try aux_state.refreshTemplates(allocator);
-        try aux_state.injectAuxFields(allocator, &gbt_json);
+        const aux_json = try aux_state.auxFieldsJson(allocator);
+        if (aux_json) |aux| {
+            defer allocator.free(aux);
+            // Insert aux fields before the closing brace of the JSON object
+            if (base_json.len > 1 and base_json[base_json.len - 1] == '}') {
+                const merged = try std.fmt.allocPrint(allocator,
+                    "{s},{s}}}",
+                    .{ base_json[0 .. base_json.len - 1], aux },
+                );
+                allocator.free(base_json);
+                base_json = merged;
+            }
+        }
     }
 
-    // Serialize to JSON string for the stratifier
-    return try serializeJson(allocator, gbt_json.value);
+    return base_json;
 }
 
 fn handleGetbest(allocator: std.mem.Allocator, parent_rpc: *rpc.Client) ![]const u8 {
@@ -263,8 +276,5 @@ fn handleSubmitauxblock(allocator: std.mem.Allocator, data: []const u8, aux_stat
 }
 
 fn serializeJson(allocator: std.mem.Allocator, value: std.json.Value) ![]const u8 {
-    var list = std.ArrayList(u8).init(allocator);
-    errdefer list.deinit();
-    try value.jsonStringify(.{}, list.writer());
-    return try list.toOwnedSlice();
+    return try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(value, .{})});
 }

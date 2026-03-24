@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix = std.posix;
 const log = std.log.scoped(.rpc);
 
 /// JSON-RPC client for Bitcoin-like chain daemons.
@@ -8,7 +9,6 @@ pub const Client = struct {
     port: u16,
     user: []const u8,
     pass: []const u8,
-    next_id: u64 = 1,
 
     pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, pass: []const u8) Client {
         return .{
@@ -26,59 +26,48 @@ pub const Client = struct {
 
     pub fn reconnect(self: *Client) void {
         log.info("reconnecting to {s}:{d}", .{ self.host, self.port });
-        // TCP connections are per-request, so reconnect is a no-op.
-        // If we add persistent connections later, reset them here.
     }
 
     /// Call getblocktemplate on the parent chain daemon.
     pub fn getBlockTemplate(self: *Client, allocator: std.mem.Allocator) !std.json.Parsed(std.json.Value) {
-        const req =
+        return try self.call(allocator,
             \\{"method":"getblocktemplate","params":[{"capabilities":["coinbasetxn","workid","coinbase/append"],"rules":["segwit"]}]}
-        ;
-        return try self.call(allocator, req);
+        );
     }
 
     /// Call getbestblockhash.
     pub fn getBestBlockHash(self: *Client, allocator: std.mem.Allocator) ![]const u8 {
-        const req =
+        var parsed = try self.call(allocator,
             \\{"method":"getbestblockhash","params":[]}
-        ;
-        var parsed = try self.call(allocator, req);
+        );
         defer parsed.deinit();
-
         const result = parsed.value.object.get("result") orelse return error.MissingResult;
         return try allocator.dupe(u8, result.string);
     }
 
     /// Call getblockcount.
     pub fn getBlockCount(self: *Client, allocator: std.mem.Allocator) !i64 {
-        const req =
+        var parsed = try self.call(allocator,
             \\{"method":"getblockcount","params":[]}
-        ;
-        var parsed = try self.call(allocator, req);
+        );
         defer parsed.deinit();
-
         const result = parsed.value.object.get("result") orelse return error.MissingResult;
         return result.integer;
     }
 
     /// Call getblockhash.
     pub fn getBlockHash(self: *Client, allocator: std.mem.Allocator, height: i64) ![]const u8 {
-        var buf: [256]u8 = undefined;
-        const req = try std.fmt.bufPrint(&buf, "{{\"method\":\"getblockhash\",\"params\":[{d}]}}", .{height});
+        const req = try std.fmt.allocPrint(allocator, "{{\"method\":\"getblockhash\",\"params\":[{d}]}}", .{height});
+        defer allocator.free(req);
         return try self.callGetString(allocator, req);
     }
 
     /// Call submitblock.
     pub fn submitBlock(self: *Client, allocator: std.mem.Allocator, block_hex: []const u8) ![]const u8 {
-        // Build request with block hex data
-        var req_buf = std.ArrayList(u8).init(allocator);
-        defer req_buf.deinit();
-        try req_buf.appendSlice("{\"method\":\"submitblock\",\"params\":[\"");
-        try req_buf.appendSlice(block_hex);
-        try req_buf.appendSlice("\"]}");
+        const req = try std.fmt.allocPrint(allocator, "{{\"method\":\"submitblock\",\"params\":[\"{s}\"]}}", .{block_hex});
+        defer allocator.free(req);
 
-        var parsed = try self.call(allocator, req_buf.items);
+        var parsed = try self.call(allocator, req);
         defer parsed.deinit();
 
         const result = parsed.value.object.get("result") orelse return error.MissingResult;
@@ -90,64 +79,37 @@ pub const Client = struct {
 
     /// Call validateaddress.
     pub fn validateAddress(self: *Client, allocator: std.mem.Allocator, addr: []const u8) ![]const u8 {
-        var buf: [512]u8 = undefined;
-        const req = try std.fmt.bufPrint(&buf, "{{\"method\":\"validateaddress\",\"params\":[\"{s}\"]}}", .{addr});
-
-        var parsed = try self.call(allocator, req);
-        defer parsed.deinit();
-
-        const result = parsed.value.object.get("result") orelse return error.MissingResult;
-        // Return the full result JSON for the stratifier to parse
-        var list = std.ArrayList(u8).init(allocator);
-        errdefer list.deinit();
-        try result.jsonStringify(.{}, list.writer());
-        return try list.toOwnedSlice();
+        const req = try std.fmt.allocPrint(allocator, "{{\"method\":\"validateaddress\",\"params\":[\"{s}\"]}}", .{addr});
+        defer allocator.free(req);
+        return try self.callGetString(allocator, req);
     }
 
     /// Call testmempoolaccept (for checktxn).
     pub fn testMempoolAccept(self: *Client, allocator: std.mem.Allocator, txn_hex: []const u8) ![]const u8 {
-        var req_buf = std.ArrayList(u8).init(allocator);
-        defer req_buf.deinit();
-        try req_buf.appendSlice("{\"method\":\"testmempoolaccept\",\"params\":[[\"");
-        try req_buf.appendSlice(txn_hex);
-        try req_buf.appendSlice("\"]]}");
-
-        var parsed = try self.call(allocator, req_buf.items);
-        defer parsed.deinit();
-
-        const result = parsed.value.object.get("result") orelse return error.MissingResult;
-        var list = std.ArrayList(u8).init(allocator);
-        errdefer list.deinit();
-        try result.jsonStringify(.{}, list.writer());
-        return try list.toOwnedSlice();
+        const req = try std.fmt.allocPrint(allocator, "{{\"method\":\"testmempoolaccept\",\"params\":[[\"{s}\"]]}}", .{txn_hex});
+        defer allocator.free(req);
+        return try self.callGetString(allocator, req);
     }
 
     /// Call getauxblock (Namecoin-style) on an aux chain daemon.
     pub fn getAuxBlock(self: *Client, allocator: std.mem.Allocator) !std.json.Parsed(std.json.Value) {
-        const req =
+        return try self.call(allocator,
             \\{"method":"getauxblock","params":[]}
-        ;
-        return try self.call(allocator, req);
+        );
     }
 
     /// Call createauxblock (newer style) on an aux chain daemon.
     pub fn createAuxBlock(self: *Client, allocator: std.mem.Allocator, address: []const u8) !std.json.Parsed(std.json.Value) {
-        var buf: [512]u8 = undefined;
-        const req = try std.fmt.bufPrint(&buf, "{{\"method\":\"createauxblock\",\"params\":[\"{s}\"]}}", .{address});
+        const req = try std.fmt.allocPrint(allocator, "{{\"method\":\"createauxblock\",\"params\":[\"{s}\"]}}", .{address});
+        defer allocator.free(req);
         return try self.call(allocator, req);
     }
 
     /// Submit an aux block with AuxPoW proof.
     pub fn submitAuxBlock(self: *Client, allocator: std.mem.Allocator, block_hash: []const u8, auxpow_hex: []const u8) ![]const u8 {
-        var req_buf = std.ArrayList(u8).init(allocator);
-        defer req_buf.deinit();
-        try req_buf.appendSlice("{\"method\":\"submitauxblock\",\"params\":[\"");
-        try req_buf.appendSlice(block_hash);
-        try req_buf.appendSlice("\",\"");
-        try req_buf.appendSlice(auxpow_hex);
-        try req_buf.appendSlice("\"]}");
-
-        return try self.callGetString(allocator, req_buf.items);
+        const req = try std.fmt.allocPrint(allocator, "{{\"method\":\"submitauxblock\",\"params\":[\"{s}\",\"{s}\"]}}", .{ block_hash, auxpow_hex });
+        defer allocator.free(req);
+        return try self.callGetString(allocator, req);
     }
 
     // --- Internal ---
@@ -169,63 +131,84 @@ pub const Client = struct {
         if (result == .string) {
             return try allocator.dupe(u8, result.string);
         }
-        // Return JSON representation for non-string results
-        var list = std.ArrayList(u8).init(allocator);
-        errdefer list.deinit();
-        try result.jsonStringify(.{}, list.writer());
-        return try list.toOwnedSlice();
+        return try jsonToString(allocator, result);
+    }
+
+    fn jsonToString(allocator: std.mem.Allocator, value: std.json.Value) ![]const u8 {
+        return try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(value, .{})});
     }
 
     fn httpPost(self: *Client, allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
-        // Build HTTP/1.1 POST request manually for JSON-RPC
-        var request_buf = std.ArrayList(u8).init(allocator);
-        defer request_buf.deinit();
+        // Build HTTP/1.1 POST request
+        var auth_header: []const u8 = "";
+        var auth_alloc: ?[]const u8 = null;
+        defer if (auth_alloc) |a| allocator.free(a);
 
-        // Request line + headers
-        try request_buf.appendSlice("POST / HTTP/1.1\r\n");
-        try std.fmt.format(request_buf.writer(), "Host: {s}:{d}\r\n", .{ self.host, self.port });
-        try request_buf.appendSlice("Content-Type: application/json\r\n");
-        try std.fmt.format(request_buf.writer(), "Content-Length: {d}\r\n", .{body.len});
-
-        // Basic auth
         if (self.user.len > 0) {
             var auth_buf: [256]u8 = undefined;
             const auth_plain = try std.fmt.bufPrint(&auth_buf, "{s}:{s}", .{ self.user, self.pass });
             var encoded_buf: [512]u8 = undefined;
             const encoded = std.base64.standard.Encoder.encode(&encoded_buf, auth_plain);
-            try std.fmt.format(request_buf.writer(), "Authorization: Basic {s}\r\n", .{encoded});
+            auth_alloc = try std.fmt.allocPrint(allocator, "Authorization: Basic {s}\r\n", .{encoded});
+            auth_header = auth_alloc.?;
         }
 
-        try request_buf.appendSlice("Connection: close\r\n\r\n");
-        try request_buf.appendSlice(body);
+        const http_req = try std.fmt.allocPrint(allocator,
+            "POST / HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n{s}Connection: close\r\n\r\n{s}",
+            .{ self.host, self.port, body.len, auth_header, body },
+        );
+        defer allocator.free(http_req);
 
-        // Connect and send
-        const address = try std.net.Address.resolveIp(self.host, self.port);
-        const stream = try std.net.tcpConnectToAddress(address);
-        defer stream.close();
+        // Connect via POSIX sockets (FreeBSD native)
+        const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        defer posix.close(sockfd);
 
-        try stream.writeAll(request_buf.items);
+        // Resolve host:port via getaddrinfo (libc)
+        var port_buf: [8]u8 = undefined;
+        const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{self.port});
+        const host_z = try allocator.dupeZ(u8, self.host);
+        defer allocator.free(host_z);
+        const port_z = try allocator.dupeZ(u8, port_str);
+        defer allocator.free(port_z);
 
-        // Read response
-        var response = std.ArrayList(u8).init(allocator);
-        errdefer response.deinit();
+        var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
+        hints.family = posix.AF.INET;
+        hints.socktype = posix.SOCK.STREAM;
 
-        var read_buf: [8192]u8 = undefined;
-        while (true) {
-            const n = stream.read(&read_buf) catch break;
+        var result: ?*std.c.addrinfo = null;
+        const gai_ret = std.c.getaddrinfo(host_z, port_z, &hints, &result);
+        if (@intFromEnum(gai_ret) != 0) return error.DnsResolutionFailed;
+        defer std.c.freeaddrinfo(result.?);
+
+        const ai = result.?;
+        try posix.connect(sockfd, ai.addr.?, ai.addrlen);
+
+        // Send request
+        _ = try posix.write(sockfd, http_req);
+
+        // Read response (up to 4MB)
+        var response_buf = try allocator.alloc(u8, 4 * 1024 * 1024);
+        var total: usize = 0;
+
+        while (total < response_buf.len) {
+            const n = posix.read(sockfd, response_buf[total..]) catch break;
             if (n == 0) break;
-            try response.appendSlice(read_buf[0..n]);
+            total += n;
         }
 
-        // Find the body (after \r\n\r\n)
-        const raw = try response.toOwnedSlice();
+        const raw = response_buf[0..total];
+
+        // Find body after \r\n\r\n header separator
         if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |header_end| {
             const body_start = header_end + 4;
-            const result = try allocator.dupe(u8, raw[body_start..]);
-            allocator.free(raw);
-            return result;
+            const result_body = try allocator.dupe(u8, raw[body_start..total]);
+            allocator.free(response_buf);
+            return result_body;
         }
 
-        return raw;
+        // No header separator found — return raw (shouldn't happen with valid HTTP)
+        const result_raw = try allocator.dupe(u8, raw);
+        allocator.free(response_buf);
+        return result_raw;
     }
 };

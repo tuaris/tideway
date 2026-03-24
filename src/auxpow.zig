@@ -129,35 +129,36 @@ pub const State = struct {
         self.buildMerkleRoot();
     }
 
-    /// Inject aux fields into the gbtbase JSON for the stratifier.
-    pub fn injectAuxFields(self: *const State, allocator: std.mem.Allocator, gbt: *std.json.Parsed(std.json.Value)) !void {
-        var obj = &gbt.value.object;
+    /// Build aux fields as a JSON string to be merged into the getbase response.
+    /// Returns null if no valid aux chains.
+    pub fn auxFieldsJson(self: *const State, allocator: std.mem.Allocator) !?[]const u8 {
+        var valid_count: usize = 0;
+        for (self.chains) |chain| {
+            if (chain.valid) valid_count += 1;
+        }
+        if (valid_count == 0) return null;
 
-        // Add merkle root
         var root_hex: [64]u8 = undefined;
-        _ = std.fmt.bufPrint(&root_hex, "{}", .{std.fmt.fmtSliceHexLower(&self.merkle_root)}) catch unreachable;
-        try obj.put("aux_merkle_root", .{ .string = try allocator.dupe(u8, &root_hex) });
+        bytesToHex(&self.merkle_root, &root_hex);
 
-        // Add tree metadata
-        try obj.put("aux_tree_size", .{ .integer = @intCast(self.tree_size) });
-        try obj.put("aux_tree_nonce", .{ .integer = @intCast(self.tree_nonce) });
-        try obj.put("n_aux_chains", .{ .integer = @intCast(self.chains.len) });
-
-        // Add per-chain info array
-        var aux_array = std.json.Array.init(allocator);
+        // Build per-chain JSON array entries
+        var chains_json = try std.fmt.allocPrint(allocator, "", .{});
         for (self.chains, 0..) |chain, i| {
             if (!chain.valid) continue;
-
-            var chain_obj = std.json.ObjectMap.init(allocator);
-            try chain_obj.put("chain_id", .{ .string = chain.chain_id });
-            try chain_obj.put("hash", .{ .string = try allocator.dupe(u8, &chain.hash_hex) });
-            try chain_obj.put("target", .{ .string = try allocator.dupe(u8, &chain.target_hex) });
-            try chain_obj.put("diff", .{ .float = chain.diff });
-            try chain_obj.put("slot", .{ .integer = @intCast(i) });
-
-            try aux_array.append(.{ .object = chain_obj });
+            const sep = if (chains_json.len > 0) "," else "";
+            const new = try std.fmt.allocPrint(allocator,
+                "{s}{{\"chain_id\":\"{s}\",\"hash\":\"{s}\",\"target\":\"{s}\",\"diff\":{d:.6},\"slot\":{d}}}",
+                .{ sep, chain.chain_id, chain.hash_hex, chain.target_hex, chain.diff, i },
+            );
+            allocator.free(chains_json);
+            chains_json = new;
         }
-        try obj.put("aux_chains", .{ .array = aux_array });
+        defer allocator.free(chains_json);
+
+        return try std.fmt.allocPrint(allocator,
+            "\"aux_merkle_root\":\"{s}\",\"aux_tree_size\":{d},\"aux_tree_nonce\":{d},\"n_aux_chains\":{d},\"aux_chains\":[{s}]",
+            .{ root_hex, self.tree_size, self.tree_nonce, valid_count, chains_json },
+        );
     }
 
     /// Submit an aux block solve. Parse the data string and construct AuxPoW proof.
@@ -246,6 +247,15 @@ pub const State = struct {
         self.merkle_root = leaves[0];
     }
 };
+
+/// Convert bytes to lowercase hex string.
+fn bytesToHex(bytes: []const u8, out: []u8) void {
+    const hex_chars = "0123456789abcdef";
+    for (bytes, 0..) |b, i| {
+        out[i * 2] = hex_chars[b >> 4];
+        out[i * 2 + 1] = hex_chars[b & 0x0f];
+    }
+}
 
 /// Compute difficulty from a 32-byte target (Bitcoin difficulty calculation).
 fn diffFromTarget(target: *const [32]u8) f64 {

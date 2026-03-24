@@ -65,12 +65,13 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
     const parent_url = (parent_map.get("url") orelse return error.MissingParentUrl).string;
     const parent_host_port = try parseUrl(parent_url);
 
-    // Parse aux chains
-    var aux_chains = std.ArrayList(AuxChain).init(allocator);
-    defer aux_chains.deinit();
+    // Parse aux chains — allocate directly since we know the count from JSON
+    var aux_chains: []AuxChain = &.{};
 
-    if (root.get("aux_chains")) |aux_array| {
-        for (aux_array.array.items) |chain_val| {
+    if (root.get("aux_chains")) |aux_val| {
+        const items = aux_val.array.items;
+        aux_chains = try allocator.alloc(AuxChain, items.len);
+        for (items, 0..) |chain_val, idx| {
             const chain = chain_val.object;
             const chain_url = (chain.get("url") orelse continue).string;
             const chain_hp = try parseUrl(chain_url);
@@ -81,14 +82,14 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
             else
                 .getauxblock;
 
-            try aux_chains.append(.{
+            aux_chains[idx] = .{
                 .chain_id = (chain.get("chain_id") orelse continue).string,
                 .host = chain_hp.host,
                 .port = chain_hp.port,
                 .user = if (chain.get("user")) |u| u.string else "",
                 .pass = if (chain.get("pass")) |p| p.string else "",
                 .rpc_method = rpc_method,
-            });
+            };
         }
     }
 
@@ -103,7 +104,7 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
             .poll_interval_ms = if (parent_map.get("poll_interval_ms")) |v| @intCast(v.integer) else 100,
             .zmq_hashblock = if (parent_map.get("zmq_hashblock")) |z| z.string else null,
         },
-        .aux_chains = try aux_chains.toOwnedSlice(),
+        .aux_chains = aux_chains,
         .raw_json = parsed,
     };
 }
