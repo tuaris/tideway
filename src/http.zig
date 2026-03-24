@@ -51,7 +51,18 @@ pub fn serve(allocator: std.mem.Allocator, cfg: config.Config) !void {
             continue;
         };
 
-        handleHttpRequest(allocator, conn, &parent_rpc, &aux_state) catch |err| {
+        // Set read timeout on accepted connection (5 seconds)
+        // Critical: SeaTidePool opens multiple simultaneous connections.
+        // Without a timeout, a blocking read on an idle connection
+        // prevents handling the connection that has the actual request.
+        const timeval = std.c.timeval{ .sec = 5, .usec = 0 };
+        posix.setsockopt(conn, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
+
+        // Per-request arena allocator — freed automatically after each request
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+
+        handleHttpRequest(arena.allocator(), conn, &parent_rpc, &aux_state) catch |err| {
             log.warn("HTTP handler error: {}", .{err});
         };
         posix.close(conn);
@@ -114,18 +125,24 @@ fn handleHttpRequest(
         if (n == 0) break;
         total += n;
 
+        log.debug("read {d} bytes (total: {d})", .{ n, total });
+
         // Check if we've received the full HTTP request (headers + body)
         // Support both \r\n\r\n (standard HTTP) and \n\n (ckpool uses plain \n)
         const sep = findHeaderSeparator(buf[0..total]);
         if (sep) |s| {
             const headers = buf[0..s.pos];
-            if (findContentLength(headers)) |content_len| {
-                const body_start = s.pos + s.len;
-                const body_received = total - body_start;
+            const cl = findContentLength(headers);
+            const body_start = s.pos + s.len;
+            const body_received = total - body_start;
+            log.debug("header_sep at {d} (len {d}), content_length={?d}, body_received={d}", .{ s.pos, s.len, cl, body_received });
+            if (cl) |content_len| {
                 if (body_received >= content_len) break;
             } else {
                 break; // No content-length, assume complete
             }
+        } else {
+            log.debug("no header separator found yet", .{});
         }
     }
 
@@ -148,8 +165,8 @@ fn handleHttpRequest(
     const method = extractMethod(body);
 
     if (method) |m| {
-        if (std.mem.eql(u8, m, "getblocktemplate")) {
-            // Intercept: enrich with aux chain data
+        if (std.mem.eql(u8, m, "getblocktemplate") and aux_state.chain_count() > 0) {
+            // Intercept only when aux chains configured; otherwise transparent proxy
             const response_body = try handleGetBlockTemplate(allocator, body, parent_rpc, aux_state);
             defer allocator.free(response_body);
             try sendHttpResponse(conn, 200, response_body);
@@ -166,22 +183,32 @@ fn handleHttpRequest(
     }
 
     // Default: transparent proxy to parent daemon
+    log.info("proxying {d}-byte request to parent daemon", .{body.len});
     const response_body = try parent_rpc.rawCall(allocator, body);
+    log.info("got {d}-byte response from parent, sending to client", .{response_body.len});
     defer allocator.free(response_body);
     try sendHttpResponse(conn, 200, response_body);
+    log.info("response sent to client", .{});
 }
 
 fn sendHttpResponse(conn: posix.socket_t, status: u16, body: []const u8) !void {
     const status_text = if (status == 200) "OK" else "Bad Request";
 
+    // Ensure body ends with \n (ckpool's read_socket_line requires line terminator)
+    const needs_newline = body.len == 0 or body[body.len - 1] != '\n';
+    const content_length = body.len + @as(usize, if (needs_newline) 1 else 0);
+
     var header_buf: [512]u8 = undefined;
     const header = std.fmt.bufPrint(&header_buf,
         "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
-        .{ status, status_text, body.len },
+        .{ status, status_text, content_length },
     ) catch return error.HeaderTooLong;
 
     _ = try posix.write(conn, header);
     _ = try posix.write(conn, body);
+    if (needs_newline) {
+        _ = try posix.write(conn, "\n");
+    }
 }
 
 const HeaderSep = struct { pos: usize, len: usize };
