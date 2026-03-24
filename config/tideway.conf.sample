@@ -1,0 +1,29 @@
+{
+  "socket_path": "/tmp/ckpool/generator",
+  "zmq_pull": "ipc:///tmp/ckpool/generator.zmq",
+
+  "parent": {
+    "url": "http://127.0.0.1:9332",
+    "user": "litecoinrpc",
+    "pass": "password",
+    "poll_interval_ms": 100,
+    "zmq_hashblock": "tcp://127.0.0.1:28332"
+  },
+
+  "aux_chains": [
+    {
+      "chain_id": "dogecoin",
+      "url": "http://127.0.0.1:22555",
+      "user": "dogerpc",
+      "pass": "password",
+      "rpc_method": "getauxblock"
+    },
+    {
+      "chain_id": "pepecoin",
+      "url": "http://127.0.0.1:33873",
+      "user": "peperpc",
+      "pass": "password",
+      "rpc_method": "getauxblock"
+    }
+  ]
+}
