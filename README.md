@@ -35,7 +35,7 @@ Miners are unaware of merge mining — they receive standard Stratum work and su
 - [Zig](https://ziglang.org/) 0.15+ (build)
 - Parent chain daemon (bitcoind, litecoind, etc.) with RPC enabled
 - Aux chain daemons with `getauxblock` or `createauxblock` RPC support
-- ckpool or SeaTidePool with external generator patches (see [Patching ckpool](#patching-ckpool))
+- [SeaTidePool](https://git.morante.net/TidePool/SeaTidePool) (has native external generator support), or ckpool with patches applied (see [Patching ckpool](#patching-ckpool))
 
 ## Building
 
@@ -96,11 +96,17 @@ See [doc/CONFIGURATION.md](doc/CONFIGURATION.md) for full reference.
 
 Either service can start first — ckpool polls the generator socket until Tideway responds.
 
-## Patching ckpool
+## Pool Compatibility
 
-Tideway requires a small patch to ckpool (or SeaTidePool) to enable external generator support and AuxPoW coinbase commitments. The patch adds ~153 lines across 7 files.
+### SeaTidePool
 
-### Quick Apply
+SeaTidePool has **native external generator support** — no patches required. Add `"external_generator": true` to your SeaTidePool config and start Tideway.
+
+### ckpool
+
+Upstream ckpool requires a small patch to enable external generator support and AuxPoW coinbase commitments (~260 lines across 7 files).
+
+**Quick apply:**
 
 ```sh
 cd /path/to/ckpool
@@ -108,14 +114,12 @@ patch -p1 < /path/to/tideway/patches/ckpool-auxpow.patch
 make clean && make
 ```
 
-### Manual Guide
+See [doc/CKPOOL_PATCHES.md](doc/CKPOOL_PATCHES.md) for a detailed walkthrough of each change.
 
-See [doc/CKPOOL_PATCHES.md](doc/CKPOOL_PATCHES.md) for a walkthrough of each change.
-
-### What the Patch Does
+**Summary of patch:**
 
 | File | Lines | Purpose |
-|------|-------|---------|
+|------|-------|--------|
 | `src/ckpool.c` | +45 | External generator config, poll thread, ZMQ PUSH init, send_proc wrapper |
 | `src/ckpool.h` | +5 | `external_generator` flag, `zmq_gen_push` pointer |
 | `src/auxpow.c` | +65 | New file: parse aux fields, insert coinbase commitment, check aux targets |
