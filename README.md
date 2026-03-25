@@ -119,4 +119,4 @@ See [doc/CKPOOL_PATCHES.md](doc/CKPOOL_PATCHES.md) for a detailed walkthrough.
 
 ## License
 
-BSD 2-Clause. See [LICENSE](LICENSE).
+BSD 2-Clause + Commons Clause. Personal, non-profit, and non-commercial use is permitted under the BSD 2-Clause license. Commercial or for-profit use requires a separate commercial license. See [LICENSE](LICENSE) for details.
