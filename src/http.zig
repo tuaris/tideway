@@ -243,6 +243,9 @@ fn handleConnection(conn: posix.socket_t, shared: *SharedState) void {
 
     handleHttpRequest(arena.allocator(), conn, shared) catch |err| {
         log.warn("HTTP handler error: {}", .{err});
+        // Return 502 Bad Gateway so the client gets a proper HTTP response
+        // instead of a dropped connection
+        sendHttpResponse(conn, 502, "{\"result\":null,\"error\":{\"code\":-1,\"message\":\"upstream connection failed\"},\"id\":null}") catch {};
     };
 }
 
