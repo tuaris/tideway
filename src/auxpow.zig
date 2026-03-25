@@ -220,6 +220,8 @@ pub const State = struct {
         }
 
         // Build leaf nodes (tree_size slots, unused slots are zero-filled)
+        // Hashes must be in INTERNAL byte order (LE) for SHA256d computation
+        // to match Dogecoin's CheckMerkleBranch verification.
         var leaves: [max_chains][32]u8 = undefined;
         for (&leaves) |*leaf| {
             leaf.* = std.mem.zeroes([32]u8);
@@ -227,28 +229,26 @@ pub const State = struct {
         for (self.chains) |chain| {
             if (chain.valid and chain.slot < self.tree_size) {
                 leaves[chain.slot] = chain.hash;
+                std.mem.reverse(u8, &leaves[chain.slot]); // display → internal
             }
         }
 
-        // Build tree bottom-up
+        // Build tree bottom-up with double SHA-256
         var level_size: u32 = self.tree_size;
         while (level_size > 1) : (level_size /= 2) {
             var i: u32 = 0;
             while (i < level_size) : (i += 2) {
-                var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-                hasher.update(&leaves[i]);
-                hasher.update(&leaves[i + 1]);
-                var first_hash: [32]u8 = undefined;
-                hasher.final(&first_hash);
-
-                // Double SHA-256
-                var hasher2 = std.crypto.hash.sha2.Sha256.init(.{});
-                hasher2.update(&first_hash);
-                hasher2.final(&leaves[i / 2]);
+                dsha256_pair(&leaves[i], &leaves[i + 1], &leaves[i / 2]);
             }
         }
 
+        // Root is in internal order; reverse to display order for commitment.
+        // Dogecoin reverses its computed root before searching the coinbase,
+        // so the commitment must contain display-order bytes.
         self.merkle_root = leaves[0];
+        if (self.tree_size > 1) {
+            std.mem.reverse(u8, &self.merkle_root);
+        }
     }
 };
 
@@ -351,6 +351,45 @@ pub fn getAuxMerkleBranch(state: *const State, slot: u32, branch: *[max_aux_bran
         depth += 1;
 
         // Compute next level in-place
+        var i: u32 = 0;
+        while (i < level_size) : (i += 2) {
+            dsha256_pair(&leaves[i], &leaves[i + 1], &leaves[i / 2]);
+        }
+        idx /= 2;
+    }
+
+    return depth;
+}
+
+/// Compute the aux chain Merkle branch from a snapshot of hashes.
+/// Used by submitauxblock to match the commitment built at GBT time.
+/// Hashes in the snapshot are in display byte order; they are reversed
+/// to internal order for SHA256d computation (matching Dogecoin's
+/// CheckMerkleBranch verification).
+pub fn getSnapshotMerkleBranch(
+    snapshot: *const [max_chains][32]u8,
+    tree_size: u32,
+    slot: u32,
+    branch: *[max_aux_branch_depth][32]u8,
+) usize {
+    if (tree_size <= 1) return 0;
+
+    // Copy snapshot into mutable working array, reversing to internal order
+    var leaves: [max_chains][32]u8 = undefined;
+    for (0..tree_size) |i| {
+        leaves[i] = snapshot[i];
+        std.mem.reverse(u8, &leaves[i]); // display → internal
+    }
+
+    var depth: usize = 0;
+    var idx: u32 = slot;
+    var level_size: u32 = tree_size;
+
+    while (level_size > 1) : (level_size /= 2) {
+        const sibling = idx ^ 1;
+        branch[depth] = leaves[sibling];
+        depth += 1;
+
         var i: u32 = 0;
         while (i < level_size) : (i += 2) {
             dsha256_pair(&leaves[i], &leaves[i + 1], &leaves[i / 2]);

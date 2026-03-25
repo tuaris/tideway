@@ -32,6 +32,19 @@ const SharedState = struct {
     // Pre-computed from GBT transaction txids — independent of the actual coinbase hash.
     cb_branch: [auxpow.max_cb_branch_depth][32]u8 = undefined,
     cb_branch_depth: usize = 0,
+
+    // Snapshot of aux chain state from the last GBT enrichment.
+    // Used for proof branch computation in submitauxblock to match
+    // the commitment that was placed in the coinbase.
+    aux_snapshot_hashes: [auxpow.max_chains][32]u8 = undefined,
+    aux_snapshot_tree_size: u32 = 0,
+    aux_snapshot_count: usize = 0,
+
+    // Flag: aux templates need refresh (set on first call and after
+    // successful aux block submit or ZMQ hashblock from aux chain).
+    // Each getauxblock call creates a NEW pending block in the aux
+    // daemon, invalidating the previous hash. Only refresh when needed.
+    aux_needs_refresh: bool = true,
 };
 
 /// A unit of work: one accepted TCP connection.
@@ -163,15 +176,11 @@ pub fn serve(allocator: std.mem.Allocator, cfg: config.Config) !void {
     changelist[n_changes] = makeEvent(sockfd, EVFILT_READ, EV_ADD | EV_ENABLE, UDATA_LISTENER);
     n_changes += 1;
 
-    // Periodic aux chain template refresh timer
-    if (shared.aux_state.chain_count() > 0) {
-        changelist[n_changes] = makeTimerEvent(
-            UDATA_AUX_TIMER,
-            cfg.parent.poll_interval_ms,
-            EV_ADD | EV_ENABLE,
-        );
-        n_changes += 1;
-    }
+    // NOTE: No timer-driven aux template refresh. Each getauxblock call
+    // creates a NEW pending block in the aux daemon and invalidates the
+    // previous one. Proactive refresh would break proof submission by
+    // invalidating hashes before shares can use them. Instead, aux
+    // templates are refreshed inline in handleGetBlockTemplate.
 
     // Apply registrations (empty eventlist = return immediately)
     _ = try posix.kevent(kq, changelist[0..n_changes], &[0]posix.Kevent{}, null);
@@ -238,7 +247,7 @@ fn makeTimerEvent(ident: usize, interval_ms: u32, flags: u16) posix.Kevent {
     };
 }
 
-/// Handle a single connection: read request, dispatch, respond, close.
+/// Handle a single connection: read one request, dispatch, respond, close.
 fn handleConnection(conn: posix.socket_t, shared: *SharedState) void {
     defer posix.close(conn);
 
@@ -247,9 +256,8 @@ fn handleConnection(conn: posix.socket_t, shared: *SharedState) void {
     defer arena.deinit();
 
     handleHttpRequest(arena.allocator(), conn, shared) catch |err| {
+        if (err == error.EndOfStream) return;
         log.warn("HTTP handler error: {}", .{err});
-        // Return 502 Bad Gateway so the client gets a proper HTTP response
-        // instead of a dropped connection
         sendHttpResponse(conn, 502, "{\"result\":null,\"error\":{\"code\":-1,\"message\":\"upstream connection failed\"},\"id\":null}") catch {};
     };
 }
@@ -292,7 +300,7 @@ fn handleHttpRequest(
         }
     }
 
-    if (total == 0) return;
+    if (total == 0) return error.EndOfStream;
 
     const request = buf[0..total];
 
@@ -455,10 +463,25 @@ fn handleGetBlockTemplate(
 
     // Enrich the coinbaseaux.flags with AuxPoW commitment
     if (shared.aux_state.chain_count() > 0) {
-        // Refresh aux templates
-        shared.aux_state.refreshTemplates(allocator) catch |err| {
-            log.warn("aux template refresh in getblocktemplate: {}", .{err});
-        };
+        // Only refresh aux templates when needed (first call, after successful
+        // aux block submit, or after ZMQ hashblock from aux chain). Each
+        // getauxblock call creates a NEW pending block, invalidating the old hash.
+        if (shared.aux_needs_refresh) {
+            shared.aux_state.refreshTemplates(allocator) catch |err| {
+                log.warn("aux template refresh in getblocktemplate: {}", .{err});
+            };
+            shared.aux_needs_refresh = false;
+        }
+
+        // Snapshot aux hashes for proof construction in submitauxblock.
+        // Must match the hashes used in the commitment below.
+        shared.aux_snapshot_tree_size = shared.aux_state.tree_size;
+        shared.aux_snapshot_count = shared.aux_state.chains.len;
+        for (shared.aux_state.chains) |chain| {
+            if (chain.valid and chain.slot < shared.aux_state.tree_size) {
+                shared.aux_snapshot_hashes[chain.slot] = chain.hash;
+            }
+        }
 
         // Build aux fields JSON and inject into coinbaseaux.flags
         if (try shared.aux_state.auxFieldsJson(allocator)) |aux_fields| {
@@ -591,9 +614,15 @@ fn handleSubmitAuxBlock(
     // converts from stratum big-endian-per-word to standard little-endian
     // serialization. Use as-is — this IS the standard 80-byte block header.
 
-    // Get aux chain Merkle branch
+    // Get aux chain Merkle branch from the SNAPSHOT (matches the commitment
+    // that was placed in the coinbase at GBT enrichment time).
     var aux_branch: [auxpow.max_aux_branch_depth][32]u8 = undefined;
-    const aux_depth = auxpow.getAuxMerkleBranch(&shared.aux_state, chain.slot, &aux_branch);
+    const aux_depth = auxpow.getSnapshotMerkleBranch(
+        &shared.aux_snapshot_hashes,
+        shared.aux_snapshot_tree_size,
+        chain.slot,
+        &aux_branch,
+    );
 
     // Serialize the AuxPoW proof
     const proof_bin = try auxpow.serializeProof(
@@ -626,6 +655,12 @@ fn handleSubmitAuxBlock(
     defer allocator.free(result);
 
     log.info("submitauxblock result for {s}: {s}", .{ chain_id, result });
+
+    // If accepted, flag for aux template refresh on next GBT call
+    if (std.mem.eql(u8, result, "true")) {
+        shared.aux_needs_refresh = true;
+        log.info("aux block accepted for {s}, will refresh templates on next GBT", .{chain_id});
+    }
 
     return try std.fmt.allocPrint(allocator,
         "{{\"result\":\"{s}\",\"error\":null,\"id\":null}}",
