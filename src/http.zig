@@ -23,6 +23,22 @@ const WORKER_COUNT: usize = 4;
 const JOB_QUEUE_CAPACITY: usize = 64;
 
 /// Shared proxy state protected by a mutex for thread-safe access.
+/// Number of historical aux snapshots to retain. Shares from older GBT
+/// responses can still construct valid proofs as long as their snapshot
+/// is in the ring buffer. 8 is generous — even at 1 GBT/sec only the
+/// last 8 seconds of work would be valid.
+const AUX_SNAPSHOT_HISTORY: usize = 8;
+
+/// A frozen snapshot of aux chain leaf hashes at the time a GBT response
+/// was enriched with an AuxPoW commitment. Keyed by the merkle root that
+/// was placed in the coinbase so submitauxblock can find the right one.
+const AuxSnapshot = struct {
+    merkle_root: [32]u8 = std.mem.zeroes([32]u8),
+    hashes: [auxpow.max_chains][32]u8 = undefined,
+    tree_size: u32 = 0,
+    valid: bool = false,
+};
+
 const SharedState = struct {
     parent_rpc: rpc.Client,
     aux_state: auxpow.State,
@@ -33,18 +49,40 @@ const SharedState = struct {
     cb_branch: [auxpow.max_cb_branch_depth][32]u8 = undefined,
     cb_branch_depth: usize = 0,
 
-    // Snapshot of aux chain state from the last GBT enrichment.
-    // Used for proof branch computation in submitauxblock to match
-    // the commitment that was placed in the coinbase.
-    aux_snapshot_hashes: [auxpow.max_chains][32]u8 = undefined,
-    aux_snapshot_tree_size: u32 = 0,
-    aux_snapshot_count: usize = 0,
+    // Ring buffer of aux chain snapshots, keyed by merkle root.
+    // Each GBT enrichment stores a snapshot here. submitauxblock
+    // parses the commitment from the coinbase to find the matching
+    // snapshot, avoiding the race where a template refresh between
+    // GBT and submit overwrites the data needed for proof construction.
+    aux_snapshots: [AUX_SNAPSHOT_HISTORY]AuxSnapshot = [_]AuxSnapshot{.{}} ** AUX_SNAPSHOT_HISTORY,
+    aux_snapshot_head: usize = 0,
 
     // Flag: aux templates need refresh (set on first call and after
     // successful aux block submit or ZMQ hashblock from aux chain).
     // Each getauxblock call creates a NEW pending block in the aux
     // daemon, invalidating the previous hash. Only refresh when needed.
     aux_needs_refresh: bool = true,
+
+    /// Store a new aux snapshot in the ring buffer.
+    fn pushAuxSnapshot(self: *SharedState, root: [32]u8, hashes: [auxpow.max_chains][32]u8, tree_size: u32) void {
+        self.aux_snapshots[self.aux_snapshot_head] = .{
+            .merkle_root = root,
+            .hashes = hashes,
+            .tree_size = tree_size,
+            .valid = true,
+        };
+        self.aux_snapshot_head = (self.aux_snapshot_head + 1) % AUX_SNAPSHOT_HISTORY;
+    }
+
+    /// Find a snapshot by its merkle root.
+    fn findAuxSnapshot(self: *const SharedState, root: [32]u8) ?*const AuxSnapshot {
+        for (&self.aux_snapshots) |*snap| {
+            if (snap.valid and std.mem.eql(u8, &snap.merkle_root, &root)) {
+                return snap;
+            }
+        }
+        return null;
+    }
 };
 
 /// A unit of work: one accepted TCP connection.
@@ -474,13 +512,22 @@ fn handleGetBlockTemplate(
         }
 
         // Snapshot aux hashes for proof construction in submitauxblock.
-        // Must match the hashes used in the commitment below.
-        shared.aux_snapshot_tree_size = shared.aux_state.tree_size;
-        shared.aux_snapshot_count = shared.aux_state.chains.len;
-        for (shared.aux_state.chains) |chain| {
-            if (chain.valid and chain.slot < shared.aux_state.tree_size) {
-                shared.aux_snapshot_hashes[chain.slot] = chain.hash;
+        // Stored in a ring buffer keyed by merkle_root so that older
+        // shares (from previous GBT responses) can still find the
+        // snapshot matching their coinbase commitment.
+        {
+            var snap_hashes: [auxpow.max_chains][32]u8 = undefined;
+            for (&snap_hashes) |*h| h.* = std.mem.zeroes([32]u8);
+            for (shared.aux_state.chains) |chain| {
+                if (chain.valid and chain.slot < shared.aux_state.tree_size) {
+                    snap_hashes[chain.slot] = chain.hash;
+                }
             }
+            shared.pushAuxSnapshot(
+                shared.aux_state.merkle_root,
+                snap_hashes,
+                shared.aux_state.tree_size,
+            );
         }
 
         // Build aux fields JSON and inject into coinbaseaux.flags
@@ -614,12 +661,27 @@ fn handleSubmitAuxBlock(
     // converts from stratum big-endian-per-word to standard little-endian
     // serialization. Use as-is — this IS the standard 80-byte block header.
 
-    // Get aux chain Merkle branch from the SNAPSHOT (matches the commitment
-    // that was placed in the coinbase at GBT enrichment time).
+    // Find the AuxPoW commitment in the coinbase to extract the merkle root.
+    // Then look up the matching snapshot from the ring buffer. This handles
+    // the case where aux templates were refreshed between GBT and submit
+    // (e.g. a faster aux chain was solved, triggering a refresh).
+    const commitment_root = findCommitmentRoot(cb_raw) orelse {
+        log.warn("submitauxblock: no AuxPoW commitment found in coinbase for {s}", .{chain_id});
+        return try allocator.dupe(u8, "{\"result\":null,\"error\":{\"code\":-1,\"message\":\"no AuxPoW commitment in coinbase\"},\"id\":null}");
+    };
+
+    const snapshot = shared.findAuxSnapshot(commitment_root) orelse {
+        var root_hex: [64]u8 = undefined;
+        auxpow.bytesToHex(&commitment_root, &root_hex);
+        log.warn("submitauxblock: no snapshot for merkle root {s} (chain {s})", .{ root_hex, chain_id });
+        return try allocator.dupe(u8, "{\"result\":null,\"error\":{\"code\":-1,\"message\":\"stale aux snapshot\"},\"id\":null}");
+    };
+
+    // Get aux chain Merkle branch from the matched snapshot.
     var aux_branch: [auxpow.max_aux_branch_depth][32]u8 = undefined;
     const aux_depth = auxpow.getSnapshotMerkleBranch(
-        &shared.aux_snapshot_hashes,
-        shared.aux_snapshot_tree_size,
+        &snapshot.hashes,
+        snapshot.tree_size,
         chain.slot,
         &aux_branch,
     );
@@ -666,6 +728,23 @@ fn handleSubmitAuxBlock(
         "{{\"result\":\"{s}\",\"error\":null,\"id\":null}}",
         .{result},
     );
+}
+
+/// Scan raw coinbase transaction bytes for the AuxPoW commitment
+/// (magic 0xfabe6d6d followed by 32-byte merkle root) and return
+/// the merkle root. Returns null if no commitment found.
+fn findCommitmentRoot(cb_raw: []const u8) ?[32]u8 {
+    if (cb_raw.len < auxpow.commitment_len) return null;
+    const needle = auxpow.magic;
+    var i: usize = 0;
+    while (i + auxpow.commitment_len <= cb_raw.len) : (i += 1) {
+        if (std.mem.eql(u8, cb_raw[i..][0..4], &needle)) {
+            var root: [32]u8 = undefined;
+            @memcpy(&root, cb_raw[i + 4 ..][0..32]);
+            return root;
+        }
+    }
+    return null;
 }
 
 /// Extract the first string parameter from a JSON-RPC request body.
