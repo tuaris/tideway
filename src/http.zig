@@ -587,14 +587,9 @@ fn handleSubmitAuxBlock(
     var header_raw: [80]u8 = undefined;
     _ = std.fmt.hexToBytes(&header_raw, header_hex) catch return error.InvalidAuxSubmit;
 
-    // ckpool/SeaTidePool sends the header byte-swapped (each 32-bit word
-    // reversed via flip_80 for hash computation). Un-swap to standard
-    // serialization. This is a ckpool internal detail, not algorithm-specific.
-    var w: usize = 0;
-    while (w < 80) : (w += 4) {
-        std.mem.swap(u8, &header_raw[w], &header_raw[w + 3]);
-        std.mem.swap(u8, &header_raw[w + 1], &header_raw[w + 2]);
-    }
+    // ckpool/SeaTidePool sends the header as 'swap' (after flip_80), which
+    // converts from stratum big-endian-per-word to standard little-endian
+    // serialization. Use as-is — this IS the standard 80-byte block header.
 
     // Get aux chain Merkle branch
     var aux_branch: [auxpow.max_aux_branch_depth][32]u8 = undefined;

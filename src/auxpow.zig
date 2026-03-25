@@ -102,8 +102,9 @@ pub const State = struct {
                     @memcpy(&chain.hash_hex, hash_str[0..64]);
                     _ = std.fmt.hexToBytes(&chain.hash, hash_str) catch continue;
                     // getauxblock returns hash in display format (big-endian hex).
-                    // Reverse to internal byte order for Merkle tree computation.
-                    std.mem.reverse(u8, &chain.hash);
+                    // Keep as-is: Dogecoin's AuxPoW verification reverses the
+                    // computed root before searching the coinbase, so the
+                    // commitment must contain the root in display byte order.
                     chain.valid = true;
                 }
             }
