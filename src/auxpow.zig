@@ -16,6 +16,7 @@ pub const commitment_len: usize = 44;
 /// Per-chain aux block template state.
 pub const ChainTemplate = struct {
     chain_id: []const u8,
+    numeric_chain_id: i32 = 0, // from getauxblock "chainid" field
     hash: [32]u8 = std.mem.zeroes([32]u8),
     hash_hex: [64]u8 = std.mem.zeroes([64]u8),
     target: [32]u8 = std.mem.zeroes([32]u8),
@@ -106,6 +107,13 @@ pub const State = struct {
                     // computed root before searching the coinbase, so the
                     // commitment must contain the root in display byte order.
                     chain.valid = true;
+                }
+            }
+
+            // Extract numeric chain ID
+            if (result_obj.get("chainid")) |cid_val| {
+                if (cid_val == .integer) {
+                    chain.numeric_chain_id = @intCast(cid_val.integer);
                 }
             }
 
@@ -205,12 +213,12 @@ pub const State = struct {
     // --- Internal ---
 
     fn assignSlots(self: *State) void {
-        // Simple sequential slot assignment for now.
-        // A production implementation would hash chain_id to determine
-        // the slot position in the Merkle tree.
-        for (self.chains, 0..) |*chain, i| {
-            chain.slot = @intCast(i);
+        // Compute deterministic slot from numeric chain ID using the
+        // Namecoin/Dogecoin LCG algorithm (getExpectedIndex).
+        for (self.chains) |*chain| {
+            chain.slot = getExpectedIndex(self.tree_nonce, chain.numeric_chain_id, self.tree_size);
         }
+        // TODO: detect and resolve slot collisions for production
     }
 
     fn buildMerkleRoot(self: *State) void {
@@ -462,6 +470,16 @@ pub fn bytesToHex(bytes: []const u8, out: []u8) void {
         out[i * 2] = hex_chars[b >> 4];
         out[i * 2 + 1] = hex_chars[b & 0x0f];
     }
+}
+
+/// Compute deterministic slot index using the Namecoin/Dogecoin LCG algorithm.
+/// Matches getExpectedIndex() in aux chain verification code exactly.
+fn getExpectedIndex(nonce: u32, chain_id: i32, tree_size: u32) u32 {
+    var rand: u32 = nonce;
+    rand = rand *% 1103515245 +% 12345;
+    rand +%= @bitCast(@as(i32, chain_id));
+    rand = rand *% 1103515245 +% 12345;
+    return rand % tree_size;
 }
 
 /// Compute difficulty from a 32-byte target in LITTLE-ENDIAN byte order
