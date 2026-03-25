@@ -587,8 +587,9 @@ fn handleSubmitAuxBlock(
     var header_raw: [80]u8 = undefined;
     _ = std.fmt.hexToBytes(&header_raw, header_hex) catch return error.InvalidAuxSubmit;
 
-    // SeaTidePool sends the header byte-swapped (each 32-bit word reversed
-    // via flip_80 for scrypt hashing). Un-swap to standard serialization.
+    // ckpool/SeaTidePool sends the header byte-swapped (each 32-bit word
+    // reversed via flip_80 for hash computation). Un-swap to standard
+    // serialization. This is a ckpool internal detail, not algorithm-specific.
     var w: usize = 0;
     while (w < 80) : (w += 4) {
         std.mem.swap(u8, &header_raw[w], &header_raw[w + 3]);
