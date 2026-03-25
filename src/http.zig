@@ -36,6 +36,8 @@ const AuxSnapshot = struct {
     merkle_root: [32]u8 = std.mem.zeroes([32]u8),
     hashes: [auxpow.max_chains][32]u8 = undefined,
     tree_size: u32 = 0,
+    cb_branch: [auxpow.max_cb_branch_depth][32]u8 = undefined,
+    cb_branch_depth: usize = 0,
     valid: bool = false,
 };
 
@@ -43,11 +45,6 @@ const SharedState = struct {
     parent_rpc: rpc.Client,
     aux_state: auxpow.State,
     mutex: std.Thread.Mutex = .{},
-
-    // Cached coinbase Merkle branch from the last GBT response.
-    // Pre-computed from GBT transaction txids — independent of the actual coinbase hash.
-    cb_branch: [auxpow.max_cb_branch_depth][32]u8 = undefined,
-    cb_branch_depth: usize = 0,
 
     // Ring buffer of aux chain snapshots, keyed by merkle root.
     // Each GBT enrichment stores a snapshot here. submitauxblock
@@ -64,11 +61,20 @@ const SharedState = struct {
     aux_needs_refresh: bool = true,
 
     /// Store a new aux snapshot in the ring buffer.
-    fn pushAuxSnapshot(self: *SharedState, root: [32]u8, hashes: [auxpow.max_chains][32]u8, tree_size: u32) void {
+    fn pushAuxSnapshot(
+        self: *SharedState,
+        root: [32]u8,
+        hashes: [auxpow.max_chains][32]u8,
+        tree_size: u32,
+        cb_branch: [auxpow.max_cb_branch_depth][32]u8,
+        cb_branch_depth: usize,
+    ) void {
         self.aux_snapshots[self.aux_snapshot_head] = .{
             .merkle_root = root,
             .hashes = hashes,
             .tree_size = tree_size,
+            .cb_branch = cb_branch,
+            .cb_branch_depth = cb_branch_depth,
             .valid = true,
         };
         self.aux_snapshot_head = (self.aux_snapshot_head + 1) % AUX_SNAPSHOT_HISTORY;
@@ -496,8 +502,11 @@ fn handleGetBlockTemplate(
     var response = try shared.parent_rpc.rawCall(allocator, request_body);
     log.info("getblocktemplate: got {d} bytes from parent", .{response.len});
 
-    // Cache coinbase Merkle branch from GBT transactions (for submitauxblock proofs)
-    cacheCbMerkleBranch(allocator, response, shared);
+    // Compute coinbase Merkle branch from GBT transactions.
+    // Stored locally, then bundled into the snapshot below.
+    var cb_branch: [auxpow.max_cb_branch_depth][32]u8 = undefined;
+    var cb_branch_depth: usize = 0;
+    computeCbMerkleBranch(allocator, response, &cb_branch, &cb_branch_depth);
 
     // Enrich the coinbaseaux.flags with AuxPoW commitment
     if (shared.aux_state.chain_count() > 0) {
@@ -511,10 +520,10 @@ fn handleGetBlockTemplate(
             shared.aux_needs_refresh = false;
         }
 
-        // Snapshot aux hashes for proof construction in submitauxblock.
-        // Stored in a ring buffer keyed by merkle_root so that older
-        // shares (from previous GBT responses) can still find the
-        // snapshot matching their coinbase commitment.
+        // Snapshot aux hashes AND coinbase branch for proof construction
+        // in submitauxblock. Stored in a ring buffer keyed by merkle_root
+        // so that older shares (from previous GBT responses) can still
+        // find the snapshot matching their coinbase commitment.
         {
             var snap_hashes: [auxpow.max_chains][32]u8 = undefined;
             for (&snap_hashes) |*h| h.* = std.mem.zeroes([32]u8);
@@ -527,6 +536,8 @@ fn handleGetBlockTemplate(
                 shared.aux_state.merkle_root,
                 snap_hashes,
                 shared.aux_state.tree_size,
+                cb_branch,
+                cb_branch_depth,
             );
         }
 
@@ -563,9 +574,16 @@ fn handleGetBlockTemplate(
     return response;
 }
 
-/// Extract transaction txids from a GBT JSON response and cache the
-/// coinbase Merkle branch in shared state.
-fn cacheCbMerkleBranch(allocator: std.mem.Allocator, response: []const u8, shared: *SharedState) void {
+/// Extract transaction txids from a GBT JSON response and compute the
+/// coinbase Merkle branch into caller-provided output buffers.
+fn computeCbMerkleBranch(
+    allocator: std.mem.Allocator,
+    response: []const u8,
+    out_branch: *[auxpow.max_cb_branch_depth][32]u8,
+    out_depth: *usize,
+) void {
+    out_depth.* = 0;
+
     // Parse the JSON response to extract transaction txids
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{
         .allocate = .alloc_always,
@@ -574,18 +592,11 @@ fn cacheCbMerkleBranch(allocator: std.mem.Allocator, response: []const u8, share
 
     const result_val = parsed.value.object.get("result") orelse return;
     if (result_val != .object) return;
-    const txns_val = result_val.object.get("transactions") orelse {
-        // No transactions — coinbase only, branch depth = 0
-        shared.cb_branch_depth = 0;
-        return;
-    };
+    const txns_val = result_val.object.get("transactions") orelse return;
     if (txns_val != .array) return;
     const txns = txns_val.array.items;
 
-    if (txns.len == 0) {
-        shared.cb_branch_depth = 0;
-        return;
-    }
+    if (txns.len == 0) return;
 
     // Extract txid hashes (binary, 32 bytes each)
     const txids = allocator.alloc([32]u8, txns.len) catch return;
@@ -600,13 +611,13 @@ fn cacheCbMerkleBranch(allocator: std.mem.Allocator, response: []const u8, share
         valid += 1;
     }
 
-    shared.cb_branch_depth = auxpow.computeCbMerkleBranch(
+    out_depth.* = auxpow.computeCbMerkleBranch(
         allocator,
         txids[0..valid],
-        &shared.cb_branch,
+        out_branch,
     ) catch 0;
 
-    log.info("cached coinbase Merkle branch: depth={d} from {d} transactions", .{ shared.cb_branch_depth, valid });
+    log.info("coinbase Merkle branch: depth={d} from {d} transactions", .{ out_depth.*, valid });
 }
 
 fn handleSubmitAuxBlock(
@@ -686,11 +697,11 @@ fn handleSubmitAuxBlock(
         &aux_branch,
     );
 
-    // Serialize the AuxPoW proof
+    // Serialize the AuxPoW proof using the snapshot's coinbase branch
     const proof_bin = try auxpow.serializeProof(
         allocator,
         cb_raw,
-        shared.cb_branch[0..shared.cb_branch_depth],
+        snapshot.cb_branch[0..snapshot.cb_branch_depth],
         aux_branch[0..aux_depth],
         chain.slot,
         &header_raw,
@@ -703,7 +714,7 @@ fn handleSubmitAuxBlock(
     auxpow.bytesToHex(proof_bin, proof_hex);
 
     log.info("submitauxblock: proof {d} bytes for {s} (cb_branch={d}, aux_branch={d})", .{
-        proof_bin.len, chain_id, shared.cb_branch_depth, aux_depth,
+        proof_bin.len, chain_id, snapshot.cb_branch_depth, aux_depth,
     });
 
     // Submit to aux chain daemon via RPC
