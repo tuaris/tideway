@@ -63,7 +63,7 @@ fn printUsage() void {
     _ = stdout.write(usage) catch {};
 }
 
-pub const version = "0.1.0";
+pub const version = "0.2.0";
 
 test {
     // Import all modules for testing
