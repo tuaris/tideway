@@ -27,6 +27,11 @@ const SharedState = struct {
     parent_rpc: rpc.Client,
     aux_state: auxpow.State,
     mutex: std.Thread.Mutex = .{},
+
+    // Cached coinbase Merkle branch from the last GBT response.
+    // Pre-computed from GBT transaction txids — independent of the actual coinbase hash.
+    cb_branch: [auxpow.max_cb_branch_depth][32]u8 = undefined,
+    cb_branch_depth: usize = 0,
 };
 
 /// A unit of work: one accepted TCP connection.
@@ -311,7 +316,7 @@ fn handleHttpRequest(
             defer shared.mutex.unlock();
             if (shared.aux_state.chain_count() > 0) {
                 // Intercept only when aux chains configured; otherwise transparent proxy
-                const response_body = try handleGetBlockTemplate(allocator, body, &shared.parent_rpc, &shared.aux_state);
+                const response_body = try handleGetBlockTemplate(allocator, body, shared);
                 defer allocator.free(response_body);
                 try sendHttpResponse(conn, 200, response_body);
                 return;
@@ -321,8 +326,7 @@ fn handleHttpRequest(
         if (std.mem.eql(u8, m, "submitauxblock")) {
             shared.mutex.lock();
             defer shared.mutex.unlock();
-            // Custom method: handle aux block submission
-            const response_body = try handleSubmitAuxBlock(allocator, body, &shared.aux_state);
+            const response_body = try handleSubmitAuxBlock(allocator, body, shared);
             defer allocator.free(response_body);
             try sendHttpResponse(conn, 200, response_body);
             return;
@@ -438,36 +442,38 @@ fn extractMethod(body: []const u8) ?[]const u8 {
 fn handleGetBlockTemplate(
     allocator: std.mem.Allocator,
     request_body: []const u8,
-    parent_rpc: *rpc.Client,
-    aux_state: *auxpow.State,
+    shared: *SharedState,
 ) ![]const u8 {
     log.info("getblocktemplate: forwarding {d} bytes to parent", .{request_body.len});
 
     // Forward to parent daemon
-    var response = try parent_rpc.rawCall(allocator, request_body);
+    var response = try shared.parent_rpc.rawCall(allocator, request_body);
     log.info("getblocktemplate: got {d} bytes from parent", .{response.len});
 
-    // If aux chains configured, enrich the coinbaseaux.flags with AuxPoW commitment
-    if (aux_state.chain_count() > 0) {
+    // Cache coinbase Merkle branch from GBT transactions (for submitauxblock proofs)
+    cacheCbMerkleBranch(allocator, response, shared);
+
+    // Enrich the coinbaseaux.flags with AuxPoW commitment
+    if (shared.aux_state.chain_count() > 0) {
         // Refresh aux templates
-        aux_state.refreshTemplates(allocator) catch |err| {
+        shared.aux_state.refreshTemplates(allocator) catch |err| {
             log.warn("aux template refresh in getblocktemplate: {}", .{err});
         };
 
         // Build aux fields JSON and inject into coinbaseaux.flags
-        if (try aux_state.auxFieldsJson(allocator)) |aux_fields| {
+        if (try shared.aux_state.auxFieldsJson(allocator)) |aux_fields| {
             defer allocator.free(aux_fields);
 
             // Also build the flags hex for coinbase commitment
             var root_hex: [64]u8 = undefined;
-            auxpow.bytesToHex(&aux_state.merkle_root, &root_hex);
+            auxpow.bytesToHex(&shared.aux_state.merkle_root, &root_hex);
 
             var tree_size_hex: [8]u8 = undefined;
-            const ts_le = std.mem.nativeToLittle(u32, aux_state.tree_size);
+            const ts_le = std.mem.nativeToLittle(u32, shared.aux_state.tree_size);
             auxpow.bytesToHex(std.mem.asBytes(&ts_le), &tree_size_hex);
 
             var tree_nonce_hex: [8]u8 = undefined;
-            const tn_le = std.mem.nativeToLittle(u32, aux_state.tree_nonce);
+            const tn_le = std.mem.nativeToLittle(u32, shared.aux_state.tree_nonce);
             auxpow.bytesToHex(std.mem.asBytes(&tn_le), &tree_nonce_hex);
 
             // AuxPoW commitment: magic + root + tree_size + tree_nonce
@@ -478,7 +484,6 @@ fn handleGetBlockTemplate(
             defer allocator.free(commitment_hex);
 
             // Inject aux fields + enriched flags into the response
-            // Find "coinbaseaux" in response and enrich the flags value
             const enriched = try injectAuxData(allocator, response, commitment_hex, aux_fields);
             allocator.free(response);
             response = enriched;
@@ -488,18 +493,165 @@ fn handleGetBlockTemplate(
     return response;
 }
 
+/// Extract transaction txids from a GBT JSON response and cache the
+/// coinbase Merkle branch in shared state.
+fn cacheCbMerkleBranch(allocator: std.mem.Allocator, response: []const u8, shared: *SharedState) void {
+    // Parse the JSON response to extract transaction txids
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{
+        .allocate = .alloc_always,
+    }) catch return;
+    defer parsed.deinit();
+
+    const result_val = parsed.value.object.get("result") orelse return;
+    if (result_val != .object) return;
+    const txns_val = result_val.object.get("transactions") orelse {
+        // No transactions — coinbase only, branch depth = 0
+        shared.cb_branch_depth = 0;
+        return;
+    };
+    if (txns_val != .array) return;
+    const txns = txns_val.array.items;
+
+    if (txns.len == 0) {
+        shared.cb_branch_depth = 0;
+        return;
+    }
+
+    // Extract txid hashes (binary, 32 bytes each)
+    const txids = allocator.alloc([32]u8, txns.len) catch return;
+    defer allocator.free(txids);
+    var valid: usize = 0;
+
+    for (txns) |txn_val| {
+        if (txn_val != .object) continue;
+        const txid_str = if (txn_val.object.get("txid")) |v| (if (v == .string) v.string else null) else null;
+        if (txid_str == null or txid_str.?.len != 64) continue;
+        _ = std.fmt.hexToBytes(&txids[valid], txid_str.?) catch continue;
+        valid += 1;
+    }
+
+    shared.cb_branch_depth = auxpow.computeCbMerkleBranch(
+        allocator,
+        txids[0..valid],
+        &shared.cb_branch,
+    ) catch 0;
+
+    log.info("cached coinbase Merkle branch: depth={d} from {d} transactions", .{ shared.cb_branch_depth, valid });
+}
+
 fn handleSubmitAuxBlock(
     allocator: std.mem.Allocator,
     request_body: []const u8,
-    aux_state: *auxpow.State,
+    shared: *SharedState,
 ) ![]const u8 {
-    // Parse the JSON-RPC params
-    _ = request_body;
-    // TODO: Extract params, construct AuxPoW proof, submit to aux daemon
-    _ = aux_state;
-    log.info("submitauxblock received (TODO: construct proof)", .{});
+    // Extract the first string parameter from JSON-RPC body
+    // Format: {"method":"submitauxblock","params":["chain_id:aux_hash:coinbase_hex:header_hex:nonce"]}
+    const params_str = extractFirstStringParam(request_body) orelse {
+        log.warn("submitauxblock: failed to extract params", .{});
+        return try allocator.dupe(u8, "{\"result\":null,\"error\":{\"code\":-1,\"message\":\"invalid params\"},\"id\":null}");
+    };
 
-    return try allocator.dupe(u8, "{\"result\":null,\"error\":null,\"id\":0}");
+    // Parse colon-delimited fields: chain_id:aux_hash:coinbase_hex:header_hex:nonce
+    var iter = std.mem.splitScalar(u8, params_str, ':');
+    const chain_id = iter.next() orelse return error.InvalidAuxSubmit;
+    const aux_hash = iter.next() orelse return error.InvalidAuxSubmit;
+    const coinbase_hex = iter.next() orelse return error.InvalidAuxSubmit;
+    const header_hex = iter.next() orelse return error.InvalidAuxSubmit;
+    // nonce field ignored (already incorporated in header)
+
+    log.info("submitauxblock for {s}: aux_hash={s}", .{ chain_id, aux_hash });
+
+    // Find the matching chain
+    var chain_idx: ?usize = null;
+    for (shared.aux_state.chains, 0..) |chain, i| {
+        if (std.mem.eql(u8, chain.chain_id, chain_id)) {
+            chain_idx = i;
+            break;
+        }
+    }
+    if (chain_idx == null) {
+        log.warn("submitauxblock: unknown chain {s}", .{chain_id});
+        return try allocator.dupe(u8, "{\"result\":null,\"error\":{\"code\":-1,\"message\":\"unknown chain\"},\"id\":null}");
+    }
+
+    const chain = &shared.aux_state.chains[chain_idx.?];
+
+    // Decode coinbase hex to binary
+    if (coinbase_hex.len % 2 != 0) return error.InvalidAuxSubmit;
+    const cb_raw = try allocator.alloc(u8, coinbase_hex.len / 2);
+    defer allocator.free(cb_raw);
+    _ = std.fmt.hexToBytes(cb_raw, coinbase_hex) catch return error.InvalidAuxSubmit;
+
+    // Decode header hex to binary (must be 80 bytes = 160 hex chars)
+    if (header_hex.len != 160) return error.InvalidAuxSubmit;
+    var header_raw: [80]u8 = undefined;
+    _ = std.fmt.hexToBytes(&header_raw, header_hex) catch return error.InvalidAuxSubmit;
+
+    // Get aux chain Merkle branch
+    var aux_branch: [auxpow.max_aux_branch_depth][32]u8 = undefined;
+    const aux_depth = auxpow.getAuxMerkleBranch(&shared.aux_state, chain.slot, &aux_branch);
+
+    // Serialize the AuxPoW proof
+    const proof_bin = try auxpow.serializeProof(
+        allocator,
+        cb_raw,
+        shared.cb_branch[0..shared.cb_branch_depth],
+        aux_branch[0..aux_depth],
+        chain.slot,
+        &header_raw,
+    );
+    defer allocator.free(proof_bin);
+
+    // Hex-encode the proof
+    const proof_hex = try allocator.alloc(u8, proof_bin.len * 2);
+    defer allocator.free(proof_hex);
+    auxpow.bytesToHex(proof_bin, proof_hex);
+
+    log.info("submitauxblock: proof {d} bytes for {s} (cb_branch={d}, aux_branch={d})", .{
+        proof_bin.len, chain_id, shared.cb_branch_depth, aux_depth,
+    });
+
+    // Submit to aux chain daemon via RPC
+    const result = chain.rpc_client.submitAuxBlock(allocator, aux_hash, proof_hex) catch |err| {
+        log.err("submitauxblock RPC failed for {s}: {}", .{ chain_id, err });
+        return try std.fmt.allocPrint(allocator,
+            "{{\"result\":null,\"error\":{{\"code\":-1,\"message\":\"aux daemon RPC failed\"}},\"id\":null}}",
+            .{},
+        );
+    };
+    defer allocator.free(result);
+
+    log.info("submitauxblock result for {s}: {s}", .{ chain_id, result });
+
+    return try std.fmt.allocPrint(allocator,
+        "{{\"result\":\"{s}\",\"error\":null,\"id\":null}}",
+        .{result},
+    );
+}
+
+/// Extract the first string parameter from a JSON-RPC request body.
+/// Finds "params":["..."] and returns the contents of the first string.
+fn extractFirstStringParam(body: []const u8) ?[]const u8 {
+    const needle = "\"params\"";
+    const idx = std.mem.indexOf(u8, body, needle) orelse return null;
+    const after = body[idx + needle.len ..];
+
+    // Skip whitespace, colon, whitespace, opening bracket
+    var pos: usize = 0;
+    while (pos < after.len and (after[pos] == ' ' or after[pos] == ':' or after[pos] == '\t' or after[pos] == '[')) {
+        pos += 1;
+    }
+    if (pos >= after.len or after[pos] != '"') return null;
+    pos += 1; // skip opening quote
+
+    // Find closing quote
+    const start = pos;
+    while (pos < after.len and after[pos] != '"') {
+        pos += 1;
+    }
+    if (pos >= after.len) return null;
+
+    return after[start..pos];
 }
 
 /// Inject AuxPoW commitment into coinbaseaux.flags and add aux_chains fields

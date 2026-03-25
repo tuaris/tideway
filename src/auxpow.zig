@@ -248,6 +248,170 @@ pub const State = struct {
     }
 };
 
+// --- Merkle Branch & Proof Construction ---
+
+pub const max_cb_branch_depth: usize = 20;
+pub const max_aux_branch_depth: usize = 5; // log2(32)
+
+/// Double SHA-256: SHA256(SHA256(data)).
+pub fn dsha256(data: []const u8, out: *[32]u8) void {
+    var h1 = std.crypto.hash.sha2.Sha256.init(.{});
+    h1.update(data);
+    var tmp: [32]u8 = undefined;
+    h1.final(&tmp);
+    var h2 = std.crypto.hash.sha2.Sha256.init(.{});
+    h2.update(&tmp);
+    h2.final(out);
+}
+
+/// Double SHA-256 of two 32-byte inputs concatenated.
+fn dsha256_pair(a: *const [32]u8, b: *const [32]u8, out: *[32]u8) void {
+    var h1 = std.crypto.hash.sha2.Sha256.init(.{});
+    h1.update(a);
+    h1.update(b);
+    var tmp: [32]u8 = undefined;
+    h1.final(&tmp);
+    var h2 = std.crypto.hash.sha2.Sha256.init(.{});
+    h2.update(&tmp);
+    h2.final(out);
+}
+
+/// Compute the coinbase Merkle branch (sibling hashes for position 0).
+/// txids are the non-coinbase transaction IDs from getblocktemplate.
+/// The branch hashes are independent of the actual coinbase hash.
+pub fn computeCbMerkleBranch(
+    allocator: std.mem.Allocator,
+    txids: []const [32]u8,
+    branch: *[max_cb_branch_depth][32]u8,
+) !usize {
+    if (txids.len == 0) return 0; // coinbase only, no branch
+
+    // Build leaves: [placeholder_for_coinbase, txid[0], txid[1], ...]
+    const n_leaves = txids.len + 1;
+    const leaves = try allocator.alloc([32]u8, n_leaves);
+    defer allocator.free(leaves);
+    leaves[0] = std.mem.zeroes([32]u8); // placeholder (value irrelevant)
+    for (txids, 0..) |txid, i| {
+        leaves[i + 1] = txid;
+    }
+
+    var depth: usize = 0;
+    var idx: usize = 0; // coinbase is always at position 0
+    var n: usize = n_leaves;
+
+    while (n > 1) {
+        // Record sibling hash
+        const sibling = idx ^ 1;
+        branch[depth] = if (sibling < n) leaves[sibling] else leaves[idx];
+        depth += 1;
+
+        // Compute next level in-place
+        var next_n: usize = 0;
+        var i: usize = 0;
+        while (i < n) : (i += 2) {
+            const right_idx = if (i + 1 < n) i + 1 else i;
+            dsha256_pair(&leaves[i], &leaves[right_idx], &leaves[next_n]);
+            next_n += 1;
+        }
+        n = next_n;
+        idx /= 2;
+    }
+
+    return depth;
+}
+
+/// Compute the aux chain Merkle branch for a given slot.
+/// Rebuilds the tree from current chain hashes (same data as buildMerkleRoot).
+pub fn getAuxMerkleBranch(state: *const State, slot: u32, branch: *[max_aux_branch_depth][32]u8) usize {
+    if (state.tree_size <= 1) return 0;
+
+    // Rebuild leaf nodes
+    var leaves: [max_chains][32]u8 = undefined;
+    for (&leaves) |*leaf| {
+        leaf.* = std.mem.zeroes([32]u8);
+    }
+    for (state.chains) |chain| {
+        if (chain.valid and chain.slot < state.tree_size) {
+            leaves[chain.slot] = chain.hash;
+        }
+    }
+
+    var depth: usize = 0;
+    var idx: u32 = slot;
+    var level_size: u32 = state.tree_size;
+
+    while (level_size > 1) : (level_size /= 2) {
+        // Record sibling
+        const sibling = idx ^ 1;
+        branch[depth] = leaves[sibling];
+        depth += 1;
+
+        // Compute next level in-place
+        var i: u32 = 0;
+        while (i < level_size) : (i += 2) {
+            dsha256_pair(&leaves[i], &leaves[i + 1], &leaves[i / 2]);
+        }
+        idx /= 2;
+    }
+
+    return depth;
+}
+
+/// Serialize an AuxPoW proof in the CAuxPow binary format.
+/// Returns heap-allocated binary proof (caller frees).
+pub fn serializeProof(
+    allocator: std.mem.Allocator,
+    coinbase_raw: []const u8,
+    cb_branch: []const [32]u8,
+    aux_branch: []const [32]u8,
+    chain_slot: u32,
+    parent_header: *const [80]u8,
+) ![]u8 {
+    // Total size: coinbase + 32 hashBlock + (1 + cb*32) + 4 index + (1 + aux*32) + 4 index + 80 header
+    const size = coinbase_raw.len + 32 + 1 + (cb_branch.len * 32) + 4 + 1 + (aux_branch.len * 32) + 4 + 80;
+    const buf = try allocator.alloc(u8, size);
+    var pos: usize = 0;
+
+    // 1. Raw coinbase transaction (CMerkleTx::CTransaction)
+    @memcpy(buf[pos..][0..coinbase_raw.len], coinbase_raw);
+    pos += coinbase_raw.len;
+
+    // 2. hashBlock (32 zero bytes — unused for AuxPoW)
+    @memset(buf[pos..][0..32], 0);
+    pos += 32;
+
+    // 3. Coinbase Merkle branch (CompactSize + hashes)
+    buf[pos] = @intCast(cb_branch.len);
+    pos += 1;
+    for (cb_branch) |hash| {
+        @memcpy(buf[pos..][0..32], &hash);
+        pos += 32;
+    }
+
+    // 4. Coinbase Merkle index (always 0 — coinbase is first tx)
+    @memset(buf[pos..][0..4], 0);
+    pos += 4;
+
+    // 5. Aux chain Merkle branch (CompactSize + hashes)
+    buf[pos] = @intCast(aux_branch.len);
+    pos += 1;
+    for (aux_branch) |hash| {
+        @memcpy(buf[pos..][0..32], &hash);
+        pos += 32;
+    }
+
+    // 6. Aux chain Merkle index (chain's slot in the tree)
+    const slot_le = std.mem.nativeToLittle(u32, chain_slot);
+    @memcpy(buf[pos..][0..4], std.mem.asBytes(&slot_le));
+    pos += 4;
+
+    // 7. Parent block header (80 bytes)
+    @memcpy(buf[pos..][0..80], parent_header);
+    pos += 80;
+
+    return buf[0..pos];
+}
+
 /// Convert bytes to lowercase hex string.
 pub fn bytesToHex(bytes: []const u8, out: []u8) void {
     const hex_chars = "0123456789abcdef";
