@@ -492,9 +492,7 @@ fn handleGetBlockTemplate(
             auxpow.bytesToHex(&shared.aux_state.merkle_root, &root_hex);
 
             var tree_size_hex: [8]u8 = undefined;
-            // AuxPoW spec: commitment stores tree_size-1. Verification adds 1
-            // to get the modulus for getExpectedIndex slot computation.
-            const ts_le = std.mem.nativeToLittle(u32, shared.aux_state.tree_size - 1);
+            const ts_le = std.mem.nativeToLittle(u32, shared.aux_state.tree_size);
             auxpow.bytesToHex(std.mem.asBytes(&ts_le), &tree_size_hex);
 
             var tree_nonce_hex: [8]u8 = undefined;
