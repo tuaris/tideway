@@ -141,14 +141,14 @@ pub const State = struct {
         var root_hex: [64]u8 = undefined;
         bytesToHex(&self.merkle_root, &root_hex);
 
-        // Build per-chain JSON array entries
+        // Build per-chain JSON array entries (accumulate)
         var chains_json = try std.fmt.allocPrint(allocator, "", .{});
         for (self.chains, 0..) |chain, i| {
             if (!chain.valid) continue;
             const sep = if (chains_json.len > 0) "," else "";
             const new = try std.fmt.allocPrint(allocator,
-                "{s}{{\"chain_id\":\"{s}\",\"hash\":\"{s}\",\"target\":\"{s}\",\"diff\":{d:.6},\"slot\":{d}}}",
-                .{ sep, chain.chain_id, chain.hash_hex, chain.target_hex, chain.diff, i },
+                "{s}{s}{{\"chain_id\":\"{s}\",\"hash\":\"{s}\",\"target\":\"{s}\",\"diff\":{d:.6},\"slot\":{d}}}",
+                .{ chains_json, sep, chain.chain_id, chain.hash_hex, chain.target_hex, chain.diff, i },
             );
             allocator.free(chains_json);
             chains_json = new;

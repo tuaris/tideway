@@ -507,36 +507,52 @@ fn injectAuxData(
     commitment_hex: []const u8,
     aux_fields_json: []const u8,
 ) ![]const u8 {
-    // Strategy: find "coinbaseaux":{"flags":"..."} and append commitment to flags value.
-    // Then add aux_* fields before the final closing braces.
     var result = try allocator.dupe(u8, response);
 
     // 1. Enrich coinbaseaux.flags with AuxPoW commitment
+    //    Handle both "flags":"..." (append) and "coinbaseaux":{} (insert key)
     const flags_needle = "\"flags\":\"";
     if (std.mem.indexOf(u8, result, flags_needle)) |flags_idx| {
+        // flags key exists — append commitment to the value
         const val_start = flags_idx + flags_needle.len;
-        // Find closing quote of the flags value
         if (std.mem.indexOfScalarPos(u8, result, val_start, '"')) |val_end| {
             const old_flags = result[val_start..val_end];
-            // New flags = old flags + commitment
             const new_flags = try std.fmt.allocPrint(allocator, "{s}{s}", .{ old_flags, commitment_hex });
             defer allocator.free(new_flags);
 
-            // Rebuild the string with the new flags value
             const new_result = try std.fmt.allocPrint(allocator, "{s}{s}{s}",
                 .{ result[0..val_start], new_flags, result[val_end..] },
             );
             allocator.free(result);
             result = new_result;
         }
+    } else if (std.mem.indexOf(u8, result, "\"coinbaseaux\":{}")) |empty_idx| {
+        // coinbaseaux is empty object — replace with flags key
+        const replace_start = empty_idx;
+        const replace_end = empty_idx + "\"coinbaseaux\":{}".len;
+        const new_result = try std.fmt.allocPrint(allocator,
+            "{s}\"coinbaseaux\":{{\"flags\":\"{s}\"}}{s}",
+            .{ result[0..replace_start], commitment_hex, result[replace_end..] },
+        );
+        allocator.free(result);
+        result = new_result;
+    } else if (std.mem.indexOf(u8, result, "\"coinbaseaux\":{")) |obj_idx| {
+        // coinbaseaux has content but no flags — insert flags at start
+        const insert_pos = obj_idx + "\"coinbaseaux\":{".len;
+        const new_result = try std.fmt.allocPrint(allocator,
+            "{s}\"flags\":\"{s}\",{s}",
+            .{ result[0..insert_pos], commitment_hex, result[insert_pos..] },
+        );
+        allocator.free(result);
+        result = new_result;
     }
 
-    // 2. Add aux_* fields to the result object (inside the "result":{...} object)
-    // Find the last }} in the response (closing result object + RPC wrapper)
-    if (lastIndexOfSubstring(result, "}}")) |last_close| {
+    // 2. Add aux_* fields to the result object
+    //    Find },"error" which marks the end of the result object in JSON-RPC
+    if (lastIndexOfSubstring(result, "},\"error\"")) |result_end| {
         const new_result = try std.fmt.allocPrint(allocator,
             "{s},{s}{s}",
-            .{ result[0..last_close], aux_fields_json, result[last_close..] },
+            .{ result[0..result_end], aux_fields_json, result[result_end..] },
         );
         allocator.free(result);
         result = new_result;
