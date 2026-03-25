@@ -71,4 +71,5 @@ test {
     _ = @import("http.zig");
     _ = @import("rpc.zig");
     _ = @import("auxpow.zig");
+    _ = @import("zmq.zig");
 }

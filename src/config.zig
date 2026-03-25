@@ -9,6 +9,7 @@ pub const AuxChain = struct {
     user: []const u8,
     pass: []const u8,
     rpc_method: RpcMethod,
+    zmq_hashblock: ?[]const u8,
 
     pub const RpcMethod = enum {
         /// Namecoin-style: getauxblock
@@ -89,6 +90,7 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
                 .user = if (chain.get("user")) |u| u.string else "",
                 .pass = if (chain.get("pass")) |p| p.string else "",
                 .rpc_method = rpc_method,
+                .zmq_hashblock = if (chain.get("zmq_hashblock")) |z| z.string else null,
             };
         }
     }

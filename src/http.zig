@@ -3,6 +3,7 @@ const posix = std.posix;
 const config = @import("config.zig");
 const rpc = @import("rpc.zig");
 const auxpow = @import("auxpow.zig");
+const zmq = @import("zmq.zig");
 
 const log = std.log.scoped(.http);
 
@@ -128,6 +129,23 @@ pub fn serve(allocator: std.mem.Allocator, cfg: config.Config) !void {
     // Start worker thread pool
     var pool = WorkerPool{ .shared = &shared };
     try pool.start();
+
+    // Start ZMQ block notification aggregator (if configured)
+    var zmq_agg: ?zmq.Aggregator = null;
+    zmq_blk: {
+        const pub_endpoint = cfg.zmq_pub orelse break :zmq_blk;
+        zmq_agg = zmq.Aggregator.init(pub_endpoint, cfg) catch |err| {
+            log.err("ZMQ aggregator init failed: {}, continuing without ZMQ", .{err});
+            break :zmq_blk;
+        };
+        const zmq_thread = std.Thread.spawn(.{}, zmq.Aggregator.run, .{&zmq_agg.?}) catch |err| {
+            log.err("ZMQ thread spawn failed: {}, continuing without ZMQ", .{err});
+            zmq_agg.?.deinit();
+            zmq_agg = null;
+            break :zmq_blk;
+        };
+        zmq_thread.detach();
+    }
 
     // Create kqueue and register events
     const kq = try posix.kqueue();

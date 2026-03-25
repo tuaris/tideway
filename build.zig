@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) void {
         .name = "tideway",
         .root_module = exe_mod,
     });
+    exe.linkSystemLibrary("libzmq");
 
     b.installArtifact(exe);
 
@@ -40,6 +41,7 @@ pub fn build(b: *std.Build) void {
         .name = "tideway-tests",
         .root_module = test_mod,
     });
+    unit_tests.linkSystemLibrary("libzmq");
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
