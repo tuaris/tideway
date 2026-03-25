@@ -101,6 +101,9 @@ pub const State = struct {
                 if (hash_str.len == 64) {
                     @memcpy(&chain.hash_hex, hash_str[0..64]);
                     _ = std.fmt.hexToBytes(&chain.hash, hash_str) catch continue;
+                    // getauxblock returns hash in display format (big-endian hex).
+                    // Reverse to internal byte order for Merkle tree computation.
+                    std.mem.reverse(u8, &chain.hash);
                     chain.valid = true;
                 }
             }
@@ -421,22 +424,24 @@ pub fn bytesToHex(bytes: []const u8, out: []u8) void {
     }
 }
 
-/// Compute difficulty from a 32-byte target (Bitcoin difficulty calculation).
+/// Compute difficulty from a 32-byte target in LITTLE-ENDIAN byte order
+/// (as returned by getauxblock RPC — LSB at index 0, MSB at index 31).
 fn diffFromTarget(target: *const [32]u8) f64 {
-    // Bitcoin truediffone = 0x00000000FFFF << 208
-    // diff = truediffone / target_as_bignum
-    // Simple approximation: count leading zero bytes and compute from first non-zero
-    var first_nonzero: usize = 0;
-    while (first_nonzero < 32 and target[first_nonzero] == 0) {
-        first_nonzero += 1;
+    // Find the most significant non-zero byte (scan from MSB end)
+    var msb_pos: usize = 31;
+    while (msb_pos > 0 and target[msb_pos] == 0) {
+        msb_pos -= 1;
     }
-    if (first_nonzero >= 32) return std.math.inf(f64);
+    if (target[msb_pos] == 0) return std.math.inf(f64);
 
-    const target_val: f64 = @floatFromInt(target[first_nonzero]);
+    const target_val: f64 = @floatFromInt(target[msb_pos]);
     if (target_val == 0) return std.math.inf(f64);
 
-    // Approximate: diff ≈ 2^(8*leading_zeros) * 256 / first_byte
-    const shift: f64 = @floatFromInt(first_nonzero * 8);
+    // leading_zeros = number of zero bytes from the MSB end
+    const leading_zeros: usize = 31 - msb_pos;
+
+    // Approximate: diff ≈ 2^(8*leading_zeros) * 256 / first_nonzero_msb_byte
+    const shift: f64 = @floatFromInt(leading_zeros * 8);
     return std.math.pow(f64, 2.0, shift) * 256.0 / target_val;
 }
 

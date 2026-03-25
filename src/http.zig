@@ -587,6 +587,14 @@ fn handleSubmitAuxBlock(
     var header_raw: [80]u8 = undefined;
     _ = std.fmt.hexToBytes(&header_raw, header_hex) catch return error.InvalidAuxSubmit;
 
+    // SeaTidePool sends the header byte-swapped (each 32-bit word reversed
+    // via flip_80 for scrypt hashing). Un-swap to standard serialization.
+    var w: usize = 0;
+    while (w < 80) : (w += 4) {
+        std.mem.swap(u8, &header_raw[w], &header_raw[w + 3]);
+        std.mem.swap(u8, &header_raw[w + 1], &header_raw[w + 2]);
+    }
+
     // Get aux chain Merkle branch
     var aux_branch: [auxpow.max_aux_branch_depth][32]u8 = undefined;
     const aux_depth = auxpow.getAuxMerkleBranch(&shared.aux_state, chain.slot, &aux_branch);
