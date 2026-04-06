@@ -1,0 +1,49 @@
+#!/bin/sh
+#
+# PROVIDE: tideway
+# REQUIRE: LOGIN
+# KEYWORD: shutdown
+#
+# Add the following lines to /etc/rc.conf to enable tideway:
+#
+# tideway_enable="YES"
+#
+# tideway_enable (bool):    Set to NO by default.
+#                           Set it to YES to enable tideway.
+# tideway_config (path):    Set to /usr/local/etc/tideway/tideway.conf by default.
+#                           Path to configuration file.
+# tideway_user (str):       The user account tideway runs as.
+#                           It uses 'tidepool' by default.
+# tideway_group (str):      The group account tideway runs as.
+#                           It uses 'tidepool' by default.
+
+. /etc/rc.subr
+
+name="tideway"
+rcvar="${name}_enable"
+
+load_rc_config $name
+
+: ${tideway_enable:="NO"}
+: ${tideway_config="/usr/local/etc/tideway/tideway.conf"}
+: ${tideway_user="tidepool"}
+: ${tideway_group="tidepool"}
+
+pidfile="/var/run/${name}/${name}.pid"
+logfile="/var/log/${name}.log"
+
+procname="/usr/local/bin/tideway"
+command="/usr/sbin/daemon"
+command_args="-p ${pidfile} -o ${logfile} -S -T ${name} -u ${tideway_user} -- ${procname} -c ${tideway_config}"
+
+required_files="${tideway_config}"
+
+start_precmd="${name}_prestart"
+
+tideway_prestart()
+{
+	install -d -o ${tideway_user} -g ${tideway_group} -m 755 /var/run/${name}
+	install -o ${tideway_user} -g ${tideway_group} -m 640 /dev/null ${logfile} 2>/dev/null || true
+}
+
+run_rc_command "$1"
