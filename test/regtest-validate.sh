@@ -146,8 +146,27 @@ fi
 log ""
 log "=== Setup ==="
 
-# Ensure wallets exist
-log "Creating wallets (if needed)..."
+# Reset regtest chain data for a clean run.
+# This avoids stale wallet/chain state from previous runs causing
+# "bad-txns-vin-empty" errors on generatetoaddress.
+log "Resetting regtest chain data for clean run..."
+for _jail_cmd in \
+    "litecoin:litecoind:/var/db/litecoin/regtest" \
+    "dogecoin-regtest:dogecoin:/var/db/dogecoin/regtest" \
+    "pepecoin-regtest:pepecoin:/var/db/pepecoin/regtest"; do
+    _jail=$(echo "$_jail_cmd" | cut -d: -f1)
+    _svc=$(echo "$_jail_cmd" | cut -d: -f2)
+    _datadir=$(echo "$_jail_cmd" | cut -d: -f3)
+    log "  Resetting $_jail..."
+    sudo jexec "$_jail" service "$_svc" stop 2>/dev/null || true
+    sleep 2
+    sudo jexec "$_jail" rm -rf "$_datadir"
+    sudo jexec "$_jail" service "$_svc" start 2>/dev/null || true
+    sleep 3
+done
+
+# Create wallets
+log "Creating wallets..."
 $LTC_CLI createwallet "pool" 2>/dev/null || true
 $DOGE_CLI createwallet "pool" 2>/dev/null || true
 $PEPE_CLI createwallet "pool" 2>/dev/null || true
