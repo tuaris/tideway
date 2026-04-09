@@ -158,11 +158,21 @@ for _jail_cmd in \
     _svc=$(echo "$_jail_cmd" | cut -d: -f2)
     _datadir=$(echo "$_jail_cmd" | cut -d: -f3)
     log "  Resetting $_jail..."
+    # Stop gracefully, then force-kill if still running after 15s
     sudo jexec "$_jail" service "$_svc" stop 2>/dev/null || true
+    _waited=0
+    while [ "$_waited" -lt 15 ]; do
+        sudo jexec "$_jail" service "$_svc" status >/dev/null 2>&1 || break
+        sleep 1
+        _waited=$((_waited + 1))
+    done
+    # Force-kill if still alive
+    sudo jexec "$_jail" killall -9 "$_svc" 2>/dev/null || true
     sleep 2
+    # Now safe to delete chain data
     sudo jexec "$_jail" rm -rf "$_datadir"
     sudo jexec "$_jail" service "$_svc" start 2>/dev/null || true
-    sleep 3
+    sleep 5
 done
 
 # Create wallets
