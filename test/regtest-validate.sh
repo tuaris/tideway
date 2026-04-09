@@ -12,7 +12,7 @@
 #   - SeaTidePool built at ../SeaTidePool/bin/tidepool (or specify STP_BIN)
 #   - cpuminer available in PATH (or specify CPUMINER_BIN)
 
-set -e
+# Do NOT set -e — we handle errors explicitly
 
 # --- Configuration ---
 TIDEWAY_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,9 +26,9 @@ TIDEWAY_CONF="/tmp/tideway-regtest.conf"
 STP_CONF="/tmp/tidepool-merge-regtest.conf"
 
 # Regtest RPC settings
-LTC_CLI="sudo jexec litecoin litecoin-cli -regtest -rpcuser=tidepool -rpcpassword=tidepoolpass"
-DOGE_CLI="sudo jexec dogecoin-regtest dogecoin-cli -regtest -rpcuser=tidepool -rpcpassword=tidepoolpass"
-PEPE_CLI="sudo jexec pepecoin-regtest pepecoin-cli -regtest -rpcuser=tidepool -rpcpassword=tidepoolpass"
+LTC_CLI="sudo jexec litecoin litecoin-cli -rpcuser=tidepool -rpcpassword=tidepoolpass -rpcport=19443"
+DOGE_CLI="sudo jexec dogecoin-regtest dogecoin-cli -rpcuser=tidepool -rpcpassword=tidepoolpass -rpcport=20443"
+PEPE_CLI="sudo jexec pepecoin-regtest pepecoin-cli -rpcuser=tidepool -rpcpassword=tidepoolpass -rpcport=21443"
 
 # Ports
 TIDEWAY_PORT=19332
@@ -159,6 +159,16 @@ PEPE_ADDR=$($PEPE_CLI getnewaddress)
 log "Litecoin pool address: $LTC_POOL_ADDR"
 log "Dogecoin address: $DOGE_ADDR"
 log "Pepecoin address: $PEPE_ADDR"
+
+# Ensure Litecoin has a peer (0.21 requires peers for getblocktemplate)
+log "Connecting Litecoin peer..."
+$LTC_CLI addnode "127.0.0.1:19445" "onetry" 2>/dev/null || true
+sleep 3
+PEER_COUNT=$($LTC_CLI getpeerinfo 2>/dev/null | grep -c '"addr"' || echo 0)
+log "Litecoin peers: $PEER_COUNT"
+if [ "$PEER_COUNT" -lt 1 ]; then
+    log "WARNING: No Litecoin peers — generatetoaddress may fail"
+fi
 
 # Generate initial blocks for maturity + getauxblock readiness
 log "Generating initial blocks (Litecoin: 110, Dogecoin: 250, Pepecoin: 250)..."
