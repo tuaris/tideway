@@ -1,0 +1,5 @@
+check program %%NAME%%-tideway with path "/usr/sbin/service -j %%NAME%% tideway status"
+    if status != 0 then restart
+    start program = "/usr/sbin/service -j %%NAME%% tideway start"
+    stop program = "/usr/sbin/service -j %%NAME%% tideway stop"
+    restart program = "/usr/sbin/service -j %%NAME%% tideway restart"
