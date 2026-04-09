@@ -151,25 +151,20 @@ log "=== Setup ==="
 # "bad-txns-vin-empty" errors on generatetoaddress.
 log "Resetting regtest chain data for clean run..."
 for _jail_cmd in \
-    "litecoin:litecoind:/var/db/litecoin/regtest" \
-    "dogecoin-regtest:dogecoin:/var/db/dogecoin/regtest" \
-    "pepecoin-regtest:pepecoin:/var/db/pepecoin/regtest"; do
+    "litecoin:litecoind:litecoind:/var/db/litecoin/regtest" \
+    "dogecoin-regtest:dogecoin:dogecoind:/var/db/dogecoin/regtest" \
+    "pepecoin-regtest:pepecoin:pepecoind:/var/db/pepecoin/regtest"; do
     _jail=$(echo "$_jail_cmd" | cut -d: -f1)
     _svc=$(echo "$_jail_cmd" | cut -d: -f2)
-    _datadir=$(echo "$_jail_cmd" | cut -d: -f3)
+    _proc=$(echo "$_jail_cmd" | cut -d: -f3)
+    _datadir=$(echo "$_jail_cmd" | cut -d: -f4)
     log "  Resetting $_jail..."
-    # Stop gracefully, then force-kill if still running after 15s
-    sudo jexec "$_jail" service "$_svc" stop 2>/dev/null || true
-    _waited=0
-    while [ "$_waited" -lt 15 ]; do
-        sudo jexec "$_jail" service "$_svc" status >/dev/null 2>&1 || break
-        sleep 1
-        _waited=$((_waited + 1))
-    done
-    # Force-kill if still alive
-    sudo jexec "$_jail" killall -9 "$_svc" 2>/dev/null || true
-    sleep 2
-    # Now safe to delete chain data
+    # Dogecoin/Pepecoin RC scripts hang on stop. Use killall directly.
+    sudo jexec "$_jail" killall "$_proc" 2>/dev/null || true
+    sleep 3
+    sudo jexec "$_jail" killall -9 "$_proc" 2>/dev/null || true
+    sleep 1
+    # Delete chain data and restart
     sudo jexec "$_jail" rm -rf "$_datadir"
     sudo jexec "$_jail" service "$_svc" start 2>/dev/null || true
     sleep 5
