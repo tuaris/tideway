@@ -412,16 +412,20 @@ BAL_LTC_AFTER=$($LTC_CLI getbalance)
 check_greater "Litecoin balance increased" "$BAL_LTC_AFTER" "$BAL_LTC_BEFORE"
 
 # Check coinbase contains AuxPoW commitment (fabe6d6d)
+# Pool-mined blocks start after the initial bootstrap (block 111+).
+# Scan from there forward — do NOT scan from tip, which is dominated
+# by generatetoaddress blocks from the maturity phase.
 if [ "$FOUND_PARENT" -eq 1 ]; then
-    # Find a pool-mined block by scanning recent blocks for our btcsig
     FOUND_AUXPOW=0
     HEIGHT=$($LTC_CLI getblockcount)
-    SCAN_START=$((HEIGHT - 20))
-    [ "$SCAN_START" -lt 1 ] && SCAN_START=1
+    SCAN_START=111
+    SCAN_END=$((SCAN_START + 50))
+    [ "$SCAN_END" -gt "$HEIGHT" ] && SCAN_END=$HEIGHT
     H=$SCAN_START
-    while [ "$H" -le "$HEIGHT" ]; do
-        BHASH=$($LTC_CLI getblockhash "$H")
-        CB_HEX=$($LTC_CLI getblock "$BHASH" 2 2>/dev/null | grep -o '"coinbase":"[^"]*"' | head -1 | sed 's/"coinbase":"//;s/"//')
+    while [ "$H" -le "$SCAN_END" ]; do
+        BHASH=$($LTC_CLI getblockhash "$H" 2>/dev/null) || { H=$((H+1)); continue; }
+        CB_HEX=$($LTC_CLI getblock "$BHASH" 2 2>/dev/null | \
+            python3 -c "import sys,json; b=json.load(sys.stdin); print(b['tx'][0]['vin'][0].get('coinbase',''))" 2>/dev/null)
         if echo "$CB_HEX" | grep -qi "fabe6d6d"; then
             FOUND_AUXPOW=1
             log "  Found fabe6d6d commitment at block $H"
