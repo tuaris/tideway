@@ -94,7 +94,10 @@ pub const State = struct {
             defer parsed.deinit();
 
             const result = parsed.value.object.get("result") orelse continue;
-            const result_obj = result.object;
+            const result_obj = switch (result) {
+                .object => |obj| obj,
+                else => continue, // null or non-object result (e.g., getauxblock before chain has blocks)
+            };
 
             // Extract block hash
             if (result_obj.get("hash")) |hash_val| {

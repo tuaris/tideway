@@ -151,6 +151,7 @@ log "=== Setup ==="
 # "bad-txns-vin-empty" errors on generatetoaddress.
 log "Resetting regtest chain data for clean run..."
 for _jail_cmd in \
+    "litecoin-peer:litecoind:litecoind:/var/db/litecoin/regtest" \
     "litecoin:litecoind:litecoind:/var/db/litecoin/regtest" \
     "dogecoin-regtest:dogecoin:dogecoind:/var/db/dogecoin/regtest" \
     "pepecoin-regtest:pepecoin:pepecoind:/var/db/pepecoin/regtest"; do
