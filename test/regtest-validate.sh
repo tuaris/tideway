@@ -126,6 +126,12 @@ log "============================================"
 log ""
 
 # --- Preflight ---
+# Kill any leftover processes from previous runs
+killall tideway 2>/dev/null || true
+killall tidepool 2>/dev/null || true
+killall cpuminer 2>/dev/null || true
+sleep 1
+
 log "=== Preflight Checks ==="
 
 check "Tideway binary exists" test -x "$TIDEWAY_BIN"
