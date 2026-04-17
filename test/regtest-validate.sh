@@ -254,6 +254,7 @@ cat > "$STP_CONF" << EOF
     }],
     "btcaddress": "${LTC_POOL_ADDR}",
     "btcsig": "/tideway-regtest/",
+    "gbt_rules": ["segwit", "mweb"],
     "serverurl": ["0.0.0.0:${STP_PORT}"],
     "mindiff": 0.001,
     "startdiff": 0.01,
@@ -315,7 +316,7 @@ FOUND_PARENT=0
 FOUND_DOGE=0
 FOUND_PEPE=0
 ELAPSED=0
-STP_LOG="${STP_LOGDIR}/main.log"
+STP_LOG="${STP_LOGDIR}/ckpool.log"
 
 while [ "$ELAPSED" -lt "$MINE_TIMEOUT" ]; do
     sleep 5
