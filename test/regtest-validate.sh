@@ -366,14 +366,13 @@ log "=== Test 1: Aux Block Rewards ==="
 check "Dogecoin aux block was mined" test "$FOUND_DOGE" -eq 1
 check "Pepecoin aux block was mined" test "$FOUND_PEPE" -eq 1
 
-BAL_DOGE_AFTER=$($DOGE_CLI getbalance)
-BAL_PEPE_AFTER=$($PEPE_CLI getbalance)
-check_greater "Dogecoin balance increased" "$BAL_DOGE_AFTER" "$BAL_DOGE_BEFORE"
-check_greater "Pepecoin balance increased" "$BAL_PEPE_AFTER" "$BAL_PEPE_BEFORE"
-
-# Mature Dogecoin coinbase
+# Mature aux coinbases before checking balance — freshly mined blocks
+# need confirmations before getbalance includes them.
 log "Maturing Dogecoin coinbase (${MATURITY_DOGE} blocks)..."
 $DOGE_CLI generate "$MATURITY_DOGE" > /dev/null 2>&1 || true
+
+BAL_DOGE_AFTER=$($DOGE_CLI getbalance)
+check_greater "Dogecoin balance increased" "$BAL_DOGE_AFTER" "$BAL_DOGE_BEFORE"
 
 # Try to spend Dogecoin
 DOGE_ADDR2=$($DOGE_CLI getnewaddress)
@@ -390,6 +389,9 @@ fi
 # Mature Pepecoin coinbase
 log "Maturing Pepecoin coinbase (${MATURITY_PEPE} blocks)..."
 $PEPE_CLI generate "$MATURITY_PEPE" > /dev/null 2>&1 || true
+
+BAL_PEPE_AFTER=$($PEPE_CLI getbalance)
+check_greater "Pepecoin balance increased" "$BAL_PEPE_AFTER" "$BAL_PEPE_BEFORE"
 
 # Try to spend Pepecoin
 PEPE_ADDR2=$($PEPE_CLI getnewaddress)
